@@ -2,11 +2,13 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+import requests
 from kiteconnect import KiteConnect
 
-st.set_page_config(page_title="ALPHA Live v1.2", page_icon="🎯", layout="wide", initial_sidebar_state="collapsed")
-st.title("🎯 ALPHA Live v1.2")
-st.caption("Live Zerodha decision-support • LONG / INTRADAY SHORT / NO-TRADE • manual execution")
+st.set_page_config(page_title="ALPHA Live v1.4", page_icon="🎯", layout="wide", initial_sidebar_state="collapsed")
+st.title("🎯 ALPHA Live v1.4")
+st.caption("Live Zerodha decision-support • technicals + 15m confirmation + NSE corporate events • manual execution")
 
 try:
     KEY = st.secrets["KITE_API_KEY"]
@@ -75,19 +77,157 @@ def atr(d,n=14):
     tr=pd.concat([(d.High-d.Low).abs(),(d.High-pc).abs(),(d.Low-pc).abs()],axis=1).max(axis=1)
     return tr.rolling(n).mean()
 
+
+IST = ZoneInfo("Asia/Kolkata")
+NIFTY50_TOKEN = 256265
+
+def nifty_hist(days=365):
+    """NIFTY 50 index history. Uses the known Kite NIFTY 50 instrument token as fallback."""
+    try:
+        raw = kite.historical_data(
+            NIFTY50_TOKEN,
+            datetime.now(IST) - timedelta(days=days),
+            datetime.now(IST),
+            "day"
+        )
+        d = pd.DataFrame(raw)
+        if len(d):
+            d = d.rename(columns=str.title).set_index("Date").sort_index()
+        return d
+    except Exception:
+        return pd.DataFrame()
+
+# ---- NSE official corporate-information layer ----
+# This is an event-risk layer, NOT a directional news-prediction engine.
+NSE_HOME = "https://www.nseindia.com"
+NSE_ANN = NSE_HOME + "/api/corporate-announcements?index=equities"
+NSE_BOARD = NSE_HOME + "/api/corporate-board-meetings?index=equities"
+NSE_ACTIONS = NSE_HOME + "/api/corporates-corporateActions?index=equities"
+
+def _nse_session():
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/124 Safari/537.36",
+        "Accept": "application/json,text/plain,*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": NSE_HOME + "/companies-listing/corporate-filings-application"
+    })
+    try:
+        s.get(NSE_HOME, timeout=8)
+    except Exception:
+        pass
+    return s
+
+def _json_rows(url):
+    try:
+        r = _nse_session().get(url, timeout=10)
+        if r.status_code != 200:
+            return []
+        x = r.json()
+        if isinstance(x, list):
+            return x
+        if isinstance(x, dict):
+            for key in ("data", "records", "result"):
+                if isinstance(x.get(key), list):
+                    return x[key]
+        return []
+    except Exception:
+        return []
+
+def _first(d, *keys):
+    for k in keys:
+        v = d.get(k)
+        if v not in (None, "", "-"):
+            return str(v)
+    return ""
+
+def _event_class(text):
+    t = (text or "").lower()
+    high = (
+        "financial result", "results", "merger", "acquisition", "order", "contract",
+        "fund raising", "buyback", "bonus", "split", "default", "fraud",
+        "resignation", "regulatory", "penalty", "insolvency", "dividend"
+    )
+    medium = (
+        "board meeting", "investor", "analyst", "press release", "record date",
+        "shareholder", "allotment", "appointment"
+    )
+    if any(x in t for x in high): return "HIGH"
+    if any(x in t for x in medium): return "MEDIUM"
+    return "LOW"
+
+@st.cache_data(ttl=300, show_spinner=False)
+def nse_event_book():
+    """Build a symbol -> recent/upcoming official NSE event map."""
+    book = {}
+    sources = [
+        ("ANNOUNCEMENT", NSE_ANN),
+        ("BOARD MEETING", NSE_BOARD),
+        ("CORPORATE ACTION", NSE_ACTIONS),
+    ]
+    for kind, url in sources:
+        for x in _json_rows(url):
+            sym = _first(x, "symbol", "sm_symbol", "symbolName", "SYMBOL").upper().strip()
+            if not sym:
+                continue
+            subject = _first(x, "subject", "desc", "purpose", "bm_purpose", "attchmntText", "details")
+            when = _first(
+                x, "an_dt", "broadcastDate", "broadcast_date", "bm_date",
+                "meetingDate", "exDate", "ex_date", "recordDate"
+            )
+            text = " ".join([kind, subject, when]).strip()
+            item = {
+                "type": kind,
+                "headline": subject or kind.title(),
+                "when": when,
+                "impact": _event_class(text),
+                "source": "NSE"
+            }
+            book.setdefault(sym, []).append(item)
+    return book
+
+def stock_event_summary(sym, book):
+    items = book.get(sym, [])
+    if not items:
+        return "None detected from current NSE event feed", "NONE", []
+    rank = {"HIGH": 3, "MEDIUM": 2, "LOW": 1}
+    items = sorted(items, key=lambda x: rank.get(x["impact"], 0), reverse=True)[:3]
+    top = items[0]
+    label = f'{top["type"]}: {top["headline"]}'
+    if top["when"]:
+        label += f' • {top["when"]}'
+    return label, top["impact"], items
+
+def event_risk_adjustment(direction, score, impact):
+    """
+    Corporate events are treated as uncertainty/risk, not guessed as bullish/bearish.
+    HIGH-impact event => require a stronger technical score.
+    """
+    required = score
+    if impact == "HIGH":
+        required = max(required, 80)
+    elif impact == "MEDIUM":
+        required = max(required, 75)
+    return required
+
 def nifty_regime():
     try:
-        d=hist("NIFTY 50","day",365)
-        if len(d)<200:
-            # index token may not be in NSE cash instrument dump; fallback quote-based neutral
-            return "SELECTIVE", 0
-        c=d.Close.astype(float); s20=c.rolling(20).mean(); s50=c.rolling(50).mean(); s200=c.rolling(200).mean()
-        px=float(c.iloc[-1])
-        if px>s20.iloc[-1]>s50.iloc[-1]>s200.iloc[-1]: return "LONG BIAS", 1
-        if px<s20.iloc[-1]<s50.iloc[-1]<s200.iloc[-1]: return "SHORT BIAS", -1
+        d = nifty_hist(365)
+        if len(d) < 200:
+            return "UNKNOWN", None
+        c = d.Close.astype(float)
+        s20 = c.rolling(20).mean()
+        s50 = c.rolling(50).mean()
+        s200 = c.rolling(200).mean()
+        px = float(c.iloc[-1])
+        ret5 = float(c.iloc[-1] / c.iloc[-6] - 1) if len(c) >= 6 else 0
+        if px > s20.iloc[-1] > s50.iloc[-1] > s200.iloc[-1] and ret5 > 0:
+            return "LONG BIAS", 1
+        if px < s20.iloc[-1] < s50.iloc[-1] < s200.iloc[-1] and ret5 < 0:
+            return "SHORT BIAS", -1
         return "SELECTIVE", 0
-    except:
-        return "SELECTIVE", 0
+    except Exception:
+        return "UNKNOWN", None
 
 def score_stock(sym, ltp, capital, risk_pct):
     d=hist(sym,"day",550)
@@ -146,21 +286,46 @@ def score_stock(sym, ltp, capital, risk_pct):
     }
 
 def intraday_confirm(sym, direction):
-    # Confirmation only; daily model remains primary.
+    """Four-factor 15m confirmation: EMA20, session VWAP, candle direction, relative volume."""
     try:
-        d=hist(sym,"15minute",10)
-        if len(d)<30:return False,"Insufficient 15m data"
-        c=d.Close.astype(float); v=d.Volume.astype(float)
-        ema20=c.ewm(span=20,adjust=False).mean()
-        px=float(c.iloc[-1])
-        vol_ok=float(v.iloc[-1]) >= float(v.tail(20).mean())*.8
-        if direction=="LONG":
-            ok=px>ema20.iloc[-1] and c.iloc[-1]>=c.iloc[-2] and vol_ok
-            return ok, "15m price above EMA20" if ok else "15m LONG confirmation weak"
-        ok=px<ema20.iloc[-1] and c.iloc[-1]<=c.iloc[-2] and vol_ok
-        return ok, "15m price below EMA20" if ok else "15m SHORT confirmation weak"
-    except Exception:
-        return False,"15m confirmation unavailable"
+        d = hist(sym, "15minute", 10)
+        if len(d) < 30:
+            return False, "Insufficient 15m data", 0, ["Insufficient 15m history"]
+
+        c = d.Close.astype(float)
+        h = d.High.astype(float)
+        lo = d.Low.astype(float)
+        v = d.Volume.astype(float)
+        ema20 = c.ewm(span=20, adjust=False).mean()
+        px = float(c.iloc[-1])
+
+        idx = pd.to_datetime(d.index)
+        latest_day = idx[-1].date()
+        mask = pd.Series([x.date() == latest_day for x in idx], index=d.index)
+        sd = d.loc[mask.values].copy()
+        typical = (sd.High.astype(float) + sd.Low.astype(float) + sd.Close.astype(float)) / 3
+        cumv = sd.Volume.astype(float).cumsum()
+        vwap = float((typical * sd.Volume.astype(float)).cumsum().iloc[-1] / max(cumv.iloc[-1], 1))
+
+        volavg = float(v.tail(20).mean())
+        checks = {}
+        if direction == "LONG":
+            checks["Above 15m EMA20"] = px > float(ema20.iloc[-1])
+            checks["Above session VWAP"] = px > vwap
+            checks["Latest candle bullish"] = float(c.iloc[-1]) >= float(d.Open.astype(float).iloc[-1])
+        else:
+            checks["Below 15m EMA20"] = px < float(ema20.iloc[-1])
+            checks["Below session VWAP"] = px < vwap
+            checks["Latest candle bearish"] = float(c.iloc[-1]) <= float(d.Open.astype(float).iloc[-1])
+        checks["Volume >= 0.8x 20-bar avg"] = float(v.iloc[-1]) >= volavg * .8
+
+        passed = sum(bool(x) for x in checks.values())
+        failed = [name for name, ok in checks.items() if not ok]
+        ok = passed >= 3
+        msg = f"{passed}/4 checks passed"
+        return ok, msg, passed, failed
+    except Exception as e:
+        return False, "15m confirmation unavailable", 0, [str(e)[:100]]
 
 tab1,tab2,tab3,tab4=st.tabs(["Market + Setups","Trade Calculator","Position Monitor","Rules"])
 
@@ -171,7 +336,9 @@ with tab1:
     minscore=st.slider("Minimum setup score",55,90,70,5)
 
     if st.button("Run ALPHA Live Decision Engine",use_container_width=True):
+        scan_time = datetime.now(IST)
         regime,bias=nifty_regime()
+        event_book = nse_event_book()
         q=kite.ltp([f"NSE:{s}" for s in SYMS])
         rows=[]
         bar=st.progress(0)
@@ -180,34 +347,61 @@ with tab1:
             if k in q:
                 z=score_stock(s,float(q[k]["last_price"]),capital,risk)
                 if z:
-                    ok,msg=intraday_confirm(s,z["Direction"])
-                    z["15m Confirm"]=ok; z["Intraday note"]=msg
+                    ok,msg,passed,failed=intraday_confirm(s,z["Direction"])
+                    z["15m Confirm"]=ok
+                    z["15m checks"]=f"{passed}/4"
+                    z["Intraday note"]=msg
+                    z["15m failed"]=" • ".join(failed) if failed else "None"
+                    ev,impact,ev_items=stock_event_summary(s,event_book)
+                    z["News / Event"]=ev
+                    z["Event impact"]=impact
+                    z["_event_items"]=ev_items
                     rows.append(z)
             bar.progress((i+1)/len(SYMS))
         df=pd.DataFrame(rows)
         if not len(df):
             st.error("No market data returned."); st.stop()
 
-        # Regime-aware filter. Shorts require intraday confirmation because NSE cash short is an intraday workflow.
-        candidates=df[df.Score>=minscore].copy()
-        candidates=candidates[candidates["15m Confirm"]==True]
-        if regime=="LONG BIAS":
-            candidates=candidates[(candidates.Direction=="LONG") | (candidates.Score>=85)]
-        elif regime=="SHORT BIAS":
-            candidates=candidates[(candidates.Direction=="SHORT") | (candidates.Score>=85)]
+        # Separate daily setup quality from intraday timing.
+        score_qualified = df[df.Score >= minscore].copy()
+        confirmed = score_qualified[score_qualified["15m Confirm"] == True].copy()
+
+        # High-impact official corporate events raise the quality threshold.
+        if len(confirmed):
+            confirmed = confirmed[
+                confirmed.apply(
+                    lambda r: r.Score >= event_risk_adjustment(r.Direction, minscore, r["Event impact"]),
+                    axis=1
+                )
+            ]
+
+        candidates = confirmed.copy()
+        if regime == "LONG BIAS":
+            candidates = candidates[(candidates.Direction=="LONG") | (candidates.Score>=85)]
+        elif regime == "SHORT BIAS":
+            candidates = candidates[(candidates.Direction=="SHORT") | (candidates.Score>=85)]
+        elif regime == "UNKNOWN":
+            candidates = candidates[candidates.Score >= max(minscore, 80)]
 
         longs=candidates[candidates.Direction=="LONG"]
         shorts=candidates[candidates.Direction=="SHORT"]
         breadth=(df.Direction=="LONG").mean()
 
-        # NO-TRADE is explicit, not forced.
-        if len(candidates)==0:
-            day="🔴 BAD TRADE TODAY — NO TRADE"
-        elif regime=="SELECTIVE" or (0.4<breadth<0.6):
-            day="🟡 SELECTIVE DAY — ONLY HIGH-QUALITY SETUPS"
+        if len(candidates):
+            if regime=="SELECTIVE" or (0.4 < breadth < 0.6):
+                day="🟡 SELECTIVE — CONFIRMED SETUPS ONLY"
+            elif regime=="UNKNOWN":
+                day="🟠 MARKET REGIME UNKNOWN — EXTRA CAUTION"
+            else:
+                day="🟢 TRADEABLE NOW — FOLLOW RISK RULES"
+        elif len(score_qualified):
+            day="🟠 WAIT — DAILY SETUPS EXIST, 15m CONFIRMATION MISSING"
+        elif regime=="SELECTIVE" and int((df.Score>=60).sum()) <= 2:
+            day="🔴 AVOID NEW TRADES NOW — WEAK OPPORTUNITY SET"
         else:
-            day="🟢 TRADEABLE DAY — FOLLOW RISK RULES"
+            day="⚪ NO SETUP NOW — STAY IN CASH"
 
+        st.caption(f"Scan time: {scan_time.strftime('%d-%b-%Y %I:%M:%S %p IST')} • Re-scan after a fresh 15-minute candle, not every few seconds.")
         st.subheader(day)
         st.write(f"**Market regime:** {regime} | **Qualified LONG:** {len(longs)} | **Qualified SHORT:** {len(shorts)}")
         picks=candidates.sort_values("Score",ascending=False).head(5)
@@ -223,14 +417,28 @@ with tab1:
                 st.write(f"**T1:** ₹{r['T1']:,.2f} → profit if hit ≈ ₹{r['Profit if T1 ₹']:,.0f}  |  **T2:** ₹{r['T2']:,.2f} → profit if hit ≈ ₹{r['Profit if T2 ₹']:,.0f}")
                 st.write(f"**Planned loss near SL:** ₹{r['Planned loss ₹']:,.0f} | **R:R:** T1 {r['R:R T1']} • T2 {r['R:R T2']}")
                 st.write(f"**Strategy evidence:** {r.Why}")
+                impact_icon = {"HIGH":"🔴","MEDIUM":"🟠","LOW":"🟡","NONE":"⚪"}.get(r["Event impact"], "⚪")
+                st.write(f'**News / Event:** {impact_icon} {r["News / Event"]} | **Event risk:** {r["Event impact"]}')
+                st.write(f'**15m confirmation:** {r["15m checks"]} passed')
+                if r["15m failed"] != "None":
+                    st.caption(f'15m failed checks: {r["15m failed"]}')
                 if r.Direction=="SHORT":
                     st.caption("SHORT = intraday cash-equity research signal only. Confirm broker product/eligibility and square-off rules before execution.")
                 st.divider()
         else:
             st.warning("ALPHA found no setup meeting the current filters. Staying in cash is the strategy.")
 
+        waiting = score_qualified[score_qualified["15m Confirm"] == False].sort_values("Score", ascending=False)
+        if len(waiting):
+            with st.expander("Why strong daily setups are still WAITING"):
+                st.dataframe(
+                    waiting[["Symbol","Direction","Score","15m checks","15m failed","News / Event","Event impact"]],
+                    use_container_width=True, hide_index=True
+                )
+
         with st.expander("Full scanner"):
-            st.dataframe(df.sort_values("Score",ascending=False),use_container_width=True,hide_index=True)
+            visible = [c for c in df.columns if c != "_event_items"]
+            st.dataframe(df[visible].sort_values("Score",ascending=False),use_container_width=True,hide_index=True)
 
 with tab2:
     st.subheader("Exact risk / reward calculator")
@@ -279,16 +487,17 @@ with tab3:
 
 with tab4:
     st.markdown("""
-**v1.2 logic**
-- Separate LONG and SHORT scores; SHORT is not merely an inverted BUY button.
-- Daily trend/breakout/breakdown/RSI/volume/momentum model.
-- 15-minute confirmation before a setup qualifies.
-- Explicit NO-TRADE state when nothing passes.
-- Position sizing from capital and planned % risk.
-- Profit is shown as **profit if target hits**, never as guaranteed expected profit.
-- Current v1.2 does **not** claim historical expectancy because that requires a proper out-of-sample backtest database.
+**v1.4 logic**
+- Separate LONG and SHORT scores using daily trend, breakout/breakdown, RSI, volume and momentum.
+- NIFTY regime uses the Kite NIFTY 50 index token fallback and reports **UNKNOWN** if regime data cannot be established.
+- 15-minute timing is transparent: EMA20, session VWAP, latest candle direction and relative volume; 3/4 are required.
+- A strong daily setup without 15m confirmation becomes **WAIT**, not automatically “BAD TRADE TODAY”.
+- Official NSE corporate announcements, board meetings and corporate actions are attached next to matching stocks when the feed is reachable.
+- HIGH-impact corporate events raise the minimum technical quality required; the app does **not** guess that an event is bullish or bearish from keywords.
+- “None detected” means no matching item was returned by the current event feed; it does not prove that no relevant public news exists anywhere.
+- Profit figures remain scenario values **if targets hit**, not guaranteed or statistically expected profit.
 - No automatic order placement.
-- News/event intelligence remains the next independent layer; it should not be faked with simple positive/negative keywords.
+- General media/news sentiment is intentionally not fabricated. A licensed/reliable news API is required before that layer should influence trading decisions.
 """)
     if st.button("Logout Zerodha session"):
         st.session_state.pop("access_token",None);st.rerun()

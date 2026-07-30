@@ -28,8 +28,8 @@ def _safe_dataframe_view(df, requested_cols=None, sort_col=None, ascending=False
     return out
 
 
-st.set_page_config(page_title="ALPHA Live v1.8", page_icon="🎯", layout="wide", initial_sidebar_state="collapsed")
-st.title("🎯 ALPHA Live v1.8")
+st.set_page_config(page_title="ALPHA Live v1.8.1", page_icon="🎯", layout="wide", initial_sidebar_state="collapsed")
+st.title("🎯 ALPHA Live v1.8.1")
 st.caption("Live Zerodha decision-support • technicals + 15m confirmation + NSE corporate events • manual execution")
 
 try:
@@ -79,14 +79,61 @@ SYMS = [
 def instrument_map():
     return {x["tradingsymbol"]: x["instrument_token"] for x in kite.instruments("NSE")}
 
+def _historical_data_chunked(token, from_dt, to_dt, interval, max_days=1900):
+    """
+    Fetch Zerodha historical candles in safe chunks and merge them.
+
+    Kite rejects overly large date ranges for many intervals.  Using 1900-day
+    chunks keeps daily research below the observed 2000-day ceiling while
+    preserving the full requested research window.
+    """
+    if from_dt >= to_dt:
+        return []
+
+    rows = []
+    cursor = from_dt
+    while cursor < to_dt:
+        chunk_to = min(cursor + timedelta(days=max_days), to_dt)
+        part = kite.historical_data(token, cursor, chunk_to, interval)
+        if part:
+            rows.extend(part)
+
+        # Advance past the previous boundary. Daily candles are deduplicated
+        # below, so a small overlap/boundary difference cannot duplicate bars.
+        cursor = chunk_to + timedelta(seconds=1)
+
+    return rows
+
+
+def _history_frame(raw):
+    """Normalize and deduplicate Kite historical-data output."""
+    d = pd.DataFrame(raw)
+    if d.empty:
+        return d
+    d = d.rename(columns=str.title)
+    if "Date" not in d.columns:
+        return pd.DataFrame()
+    d["Date"] = pd.to_datetime(d["Date"], errors="coerce")
+    d = d.dropna(subset=["Date"]).drop_duplicates(subset=["Date"], keep="last")
+    return d.set_index("Date").sort_index()
+
+
 def hist(sym, interval="day", days=550):
     tok = instrument_map().get(sym)
-    if not tok: return pd.DataFrame()
-    raw = kite.historical_data(tok, datetime.now()-timedelta(days=days), datetime.now(), interval)
-    d = pd.DataFrame(raw)
-    if len(d):
-        d = d.rename(columns=str.title).set_index("Date").sort_index()
-    return d
+    if not tok:
+        return pd.DataFrame()
+
+    end = datetime.now()
+    start = end - timedelta(days=int(days))
+
+    # Daily research/backtests can request >2000 calendar days. Fetch those
+    # windows in chunks rather than silently shortening the test.
+    if interval == "day" and int(days) > 1900:
+        raw = _historical_data_chunked(tok, start, end, interval, max_days=1900)
+    else:
+        raw = kite.historical_data(tok, start, end, interval)
+
+    return _history_frame(raw)
 
 def rsi(c, n=14):
     x=c.diff()
@@ -104,18 +151,17 @@ IST = ZoneInfo("Asia/Kolkata")
 NIFTY50_TOKEN = 256265
 
 def nifty_hist(days=365):
-    """NIFTY 50 index history. Uses the known Kite NIFTY 50 instrument token as fallback."""
+    """NIFTY 50 history, with chunked fetching for long evidence windows."""
     try:
-        raw = kite.historical_data(
-            NIFTY50_TOKEN,
-            datetime.now(IST) - timedelta(days=days),
-            datetime.now(IST),
-            "day"
-        )
-        d = pd.DataFrame(raw)
-        if len(d):
-            d = d.rename(columns=str.title).set_index("Date").sort_index()
-        return d
+        end = datetime.now(IST)
+        start = end - timedelta(days=int(days))
+        if int(days) > 1900:
+            raw = _historical_data_chunked(
+                NIFTY50_TOKEN, start, end, "day", max_days=1900
+            )
+        else:
+            raw = kite.historical_data(NIFTY50_TOKEN, start, end, "day")
+        return _history_frame(raw)
     except Exception:
         return pd.DataFrame()
 
@@ -1095,15 +1141,39 @@ with tab5:
         prog=st.progress(0)
         rg=historical_regime_series(max(2200,ev_years*400+300))
         all_bt=[]
+        failures=[]
+        completed=0
         for i,sym in enumerate(ev_syms):
             try:
                 z=backtest_symbol_v18(sym,55,ev_years,ev_hold,rg)
-                if len(z): all_bt.append(z)
+                completed += 1
+                if len(z):
+                    all_bt.append(z)
+                else:
+                    st.caption(f"{sym}: history fetched, but no qualifying research trades were produced.")
             except Exception as e:
-                st.caption(f"{sym}: research unavailable — {str(e)[:100]}")
+                failures.append((sym, str(e)))
+                st.caption(f"{sym}: research unavailable — {str(e)[:160]}")
             prog.progress((i+1)/max(len(ev_syms),1))
+
         st.session_state.alpha_research_bt=pd.concat(all_bt,ignore_index=True) if all_bt else pd.DataFrame()
-        st.success("Evidence database refreshed. Re-run the Evidence Scanner so live candidates can be gated by OOS evidence.")
+
+        if all_bt:
+            st.success(
+                f"Evidence database refreshed • {completed}/{len(ev_syms)} symbols processed • "
+                f"{len(st.session_state.alpha_research_bt)} research trades created. "
+                "Re-run the Evidence Scanner so live candidates can be gated by OOS evidence."
+            )
+        elif failures:
+            st.error(
+                "Evidence database was NOT built because historical research failed. "
+                "Review the per-symbol errors above; ALPHA will keep live candidates at RESEARCH / WAIT."
+            )
+        else:
+            st.warning(
+                "Historical data was processed, but no qualifying research trades were produced "
+                "for the selected universe/settings."
+            )
     research=st.session_state.get("alpha_research_bt",pd.DataFrame())
     if len(research):
         train,oos=_date_split(research,.70)

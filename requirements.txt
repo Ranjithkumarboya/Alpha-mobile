@@ -2,3 +2,5 @@ streamlit>=1.40,<2
 pandas>=2.0
 numpy>=1.24
 kiteconnect>=5.0
+requests>=2.31
+tzdata>=2024.1

@@ -28,8 +28,8 @@ def _safe_dataframe_view(df, requested_cols=None, sort_col=None, ascending=False
     return out
 
 
-st.set_page_config(page_title="ALPHA Live v1.8.1", page_icon="🎯", layout="wide", initial_sidebar_state="collapsed")
-st.title("🎯 ALPHA Live v1.8.1")
+st.set_page_config(page_title="ALPHA Live v1.7", page_icon="🎯", layout="wide", initial_sidebar_state="collapsed")
+st.title("🎯 ALPHA Live v1.7")
 st.caption("Live Zerodha decision-support • technicals + 15m confirmation + NSE corporate events • manual execution")
 
 try:
@@ -79,61 +79,14 @@ SYMS = [
 def instrument_map():
     return {x["tradingsymbol"]: x["instrument_token"] for x in kite.instruments("NSE")}
 
-def _historical_data_chunked(token, from_dt, to_dt, interval, max_days=1900):
-    """
-    Fetch Zerodha historical candles in safe chunks and merge them.
-
-    Kite rejects overly large date ranges for many intervals.  Using 1900-day
-    chunks keeps daily research below the observed 2000-day ceiling while
-    preserving the full requested research window.
-    """
-    if from_dt >= to_dt:
-        return []
-
-    rows = []
-    cursor = from_dt
-    while cursor < to_dt:
-        chunk_to = min(cursor + timedelta(days=max_days), to_dt)
-        part = kite.historical_data(token, cursor, chunk_to, interval)
-        if part:
-            rows.extend(part)
-
-        # Advance past the previous boundary. Daily candles are deduplicated
-        # below, so a small overlap/boundary difference cannot duplicate bars.
-        cursor = chunk_to + timedelta(seconds=1)
-
-    return rows
-
-
-def _history_frame(raw):
-    """Normalize and deduplicate Kite historical-data output."""
-    d = pd.DataFrame(raw)
-    if d.empty:
-        return d
-    d = d.rename(columns=str.title)
-    if "Date" not in d.columns:
-        return pd.DataFrame()
-    d["Date"] = pd.to_datetime(d["Date"], errors="coerce")
-    d = d.dropna(subset=["Date"]).drop_duplicates(subset=["Date"], keep="last")
-    return d.set_index("Date").sort_index()
-
-
 def hist(sym, interval="day", days=550):
     tok = instrument_map().get(sym)
-    if not tok:
-        return pd.DataFrame()
-
-    end = datetime.now()
-    start = end - timedelta(days=int(days))
-
-    # Daily research/backtests can request >2000 calendar days. Fetch those
-    # windows in chunks rather than silently shortening the test.
-    if interval == "day" and int(days) > 1900:
-        raw = _historical_data_chunked(tok, start, end, interval, max_days=1900)
-    else:
-        raw = kite.historical_data(tok, start, end, interval)
-
-    return _history_frame(raw)
+    if not tok: return pd.DataFrame()
+    raw = kite.historical_data(tok, datetime.now()-timedelta(days=days), datetime.now(), interval)
+    d = pd.DataFrame(raw)
+    if len(d):
+        d = d.rename(columns=str.title).set_index("Date").sort_index()
+    return d
 
 def rsi(c, n=14):
     x=c.diff()
@@ -151,17 +104,18 @@ IST = ZoneInfo("Asia/Kolkata")
 NIFTY50_TOKEN = 256265
 
 def nifty_hist(days=365):
-    """NIFTY 50 history, with chunked fetching for long evidence windows."""
+    """NIFTY 50 index history. Uses the known Kite NIFTY 50 instrument token as fallback."""
     try:
-        end = datetime.now(IST)
-        start = end - timedelta(days=int(days))
-        if int(days) > 1900:
-            raw = _historical_data_chunked(
-                NIFTY50_TOKEN, start, end, "day", max_days=1900
-            )
-        else:
-            raw = kite.historical_data(NIFTY50_TOKEN, start, end, "day")
-        return _history_frame(raw)
+        raw = kite.historical_data(
+            NIFTY50_TOKEN,
+            datetime.now(IST) - timedelta(days=days),
+            datetime.now(IST),
+            "day"
+        )
+        d = pd.DataFrame(raw)
+        if len(d):
+            d = d.rename(columns=str.title).set_index("Date").sort_index()
+        return d
     except Exception:
         return pd.DataFrame()
 
@@ -743,183 +697,10 @@ def backtest_metrics(bt):
             'Net R':float(r.sum()),'Max drawdown R':float(dd.min())}
 
 
-
-# ==================== v1.8 Evidence + Calibration Layer ====================
-
-def classify_setup_at_bar(d, i, sig=None):
-    """Classify the historical daily setup without using future bars."""
-    if sig is None:
-        sig = _score_at_bar(d, i)
-    if not sig or i < 200:
-        return "NO VALID SETUP"
-    x=d.iloc[:i+1]
-    c=x.Close.astype(float); h=x.High.astype(float); lo=x.Low.astype(float)
-    s20=c.rolling(20).mean(); s50=c.rolling(50).mean(); s200=c.rolling(200).mean()
-    px=float(c.iloc[-1])
-    hi=float(h.shift(1).rolling(20).max().iloc[-1])
-    low20=float(lo.shift(1).rolling(20).min().iloc[-1])
-    direction=sig["direction"]
-    if direction=="LONG":
-        if px > hi: return "TREND BREAKOUT"
-        if px > s200.iloc[-1] and s20.iloc[-1] > s50.iloc[-1] and abs(px/s20.iloc[-1]-1) <= .03:
-            return "TREND PULLBACK"
-        if px > s50.iloc[-1] > s200.iloc[-1]: return "MOMENTUM CONTINUATION"
-    else:
-        if px < low20: return "BREAKDOWN / SHORT"
-        if px < s200.iloc[-1] and s20.iloc[-1] < s50.iloc[-1] and abs(px/s20.iloc[-1]-1) <= .03:
-            return "BEAR TREND PULLBACK"
-        if px < s50.iloc[-1] < s200.iloc[-1]: return "BEAR MOMENTUM"
-    return "MIXED TECHNICAL SETUP"
-
-def historical_regime_series(days=2200):
-    """Point-in-time NIFTY daily regime map used by historical validation."""
-    d=nifty_hist(days)
-    if d.empty or len(d)<210: return {}
-    c=d.Close.astype(float)
-    s20=c.rolling(20).mean(); s50=c.rolling(50).mean(); s200=c.rolling(200).mean()
-    out={}
-    for i in range(200,len(d)):
-        px=float(c.iloc[i]); ret5=float(c.iloc[i]/c.iloc[i-5]-1) if i>=5 else 0
-        if px>s20.iloc[i]>s50.iloc[i]>s200.iloc[i] and ret5>0: rg="LONG BIAS"
-        elif px<s20.iloc[i]<s50.iloc[i]<s200.iloc[i] and ret5<0: rg="SHORT BIAS"
-        else: rg="SELECTIVE"
-        out[pd.to_datetime(d.index[i]).date()]=rg
-    return out
-
-def backtest_symbol_v18(sym, min_score=55, years=5, max_hold=20, regime_map=None):
-    """Research dataset: signal features + future R, using only point-in-time information."""
-    days=max(800,int(years*365)+300)
-    d=hist(sym,'day',days)
-    if len(d)<230: return pd.DataFrame()
-    d=d.copy().dropna(subset=['Open','High','Low','Close'])
-    start=max(200,len(d)-int(years*252)-max_hold-5)
-    rows=[]; next_free=start
-    for i in range(start,len(d)-1):
-        if i<next_free: continue
-        sig=_score_at_bar(d,i)
-        if not sig or sig["score"]<min_score: continue
-        out=_walk_forward_trade(d,i,sig,max_hold)
-        if not out: continue
-        exit_i,r,outcome=out
-        dt=pd.to_datetime(d.index[i]).date()
-        setup=classify_setup_at_bar(d,i,sig)
-        rg=(regime_map or {}).get(dt,"UNKNOWN")
-        rows.append({
-            "Symbol":sym,"Signal Date":str(dt),"Entry Date":str(pd.to_datetime(d.index[i+1]).date()),
-            "Direction":sig["direction"],"Score":sig["score"],"Setup":setup,"Regime":rg,
-            "R":round(float(r),3),"Outcome":outcome,
-            "Exit Date":str(pd.to_datetime(d.index[exit_i]).date())
-        })
-        next_free=exit_i+1
-    return pd.DataFrame(rows)
-
-def evidence_metrics(bt):
-    m=backtest_metrics(bt)
-    if not m: return None
-    # Practical robustness diagnostics, not claims of statistical certainty.
-    g=bt.copy()
-    g["Year"]=pd.to_datetime(g["Signal Date"],errors="coerce").dt.year
-    yearly=[]
-    for y,yy in g.groupby("Year"):
-        mm=backtest_metrics(yy)
-        if mm: yearly.append(mm["Expectancy R"])
-    positive_year_share=(sum(x>0 for x in yearly)/len(yearly)) if yearly else 0
-    return {**m,"Positive year share":positive_year_share,"Years":len(yearly)}
-
-def _date_split(bt, train_frac=.70):
-    if bt is None or bt.empty: return pd.DataFrame(),pd.DataFrame()
-    x=bt.copy()
-    x["_dt"]=pd.to_datetime(x["Signal Date"],errors="coerce")
-    x=x.sort_values("_dt").dropna(subset=["_dt"])
-    dates=sorted(x["_dt"].dt.date.unique())
-    if len(dates)<2:return x.iloc[0:0],x
-    cut=dates[max(1,min(len(dates)-1,int(len(dates)*train_frac)))-1]
-    return x[x["_dt"].dt.date<=cut].drop(columns=["_dt"]), x[x["_dt"].dt.date>cut].drop(columns=["_dt"])
-
-def comparable_evidence(research_bt, symbol, direction, setup, regime, score, min_n=20):
-    """
-    Prefer same symbol+direction+setup+regime. Relax progressively if sample is too small.
-    Evidence is descriptive historical/OOS evidence, not a probability guarantee.
-    """
-    if research_bt is None or research_bt.empty:
-        return None
-    train,oos=_date_split(research_bt,.70)
-    if oos.empty:return None
-
-    score_lo=max(55,int(score)-10); score_hi=min(100,int(score)+10)
-    filters=[
-        ("EXACT", lambda x:(x.Symbol==symbol)&(x.Direction==direction)&(x.Setup==setup)&(x.Regime==regime)&x.Score.between(score_lo,score_hi)),
-        ("SETUP+REGIME", lambda x:(x.Direction==direction)&(x.Setup==setup)&(x.Regime==regime)&x.Score.between(score_lo,score_hi)),
-        ("SETUP", lambda x:(x.Direction==direction)&(x.Setup==setup)&x.Score.between(score_lo,score_hi)),
-        ("DIRECTION+SCORE", lambda x:(x.Direction==direction)&x.Score.between(score_lo,score_hi)),
-    ]
-    chosen=None; level=None
-    for name,fn in filters:
-        z=oos[fn(oos)]
-        if len(z)>=min_n:
-            chosen=z;level=name;break
-    if chosen is None:
-        name,fn=filters[-1]; chosen=oos[fn(oos)]; level="LOW SAMPLE"
-    m=evidence_metrics(chosen)
-    if not m:return None
-    # Hard evidence gates. Designed to reject weak/unstable edges rather than maximize trade count.
-    sample_ok=m["Trades"]>=min_n
-    exp_ok=m["Expectancy R"]>=0.15
-    pf_ok=m["Profit factor"]>=1.30
-    dd_ok=m["Max drawdown R"]>=-12
-    stability_ok=(m["Years"]<2) or (m["Positive year share"]>=0.50)
-    passed=sum([sample_ok,exp_ok,pf_ok,dd_ok,stability_ok])
-    if passed==5: strength="STRONG"
-    elif passed>=3 and sample_ok and m["Expectancy R"]>0 and m["Profit factor"]>1: strength="MIXED"
-    else: strength="WEAK"
-    return {
-        "level":level,"strength":strength,"sample":m["Trades"],"win_rate":m["Win rate %"],
-        "expectancy":m["Expectancy R"],"pf":m["Profit factor"],"max_dd":m["Max drawdown R"],
-        "positive_year_share":m["Positive year share"],"gate_pass":strength=="STRONG"
-    }
-
-def live_setup_class(sym, direction):
-    d=hist(sym,"day",550)
-    if len(d)<210:return "NO VALID SETUP"
-    sig=_score_at_bar(d,len(d)-1)
-    return classify_setup_at_bar(d,len(d)-1,sig) if sig else "NO VALID SETUP"
-
-def final_alpha_verdict(row, evidence, intraday_ok, event_impact, regime):
-    """Evidence first. A high technical score cannot override failed historical evidence."""
-    if evidence is None:
-        return "RESEARCH / WAIT", "No OOS historical evidence loaded"
-    if evidence["sample"] < 20:
-        return "RESEARCH / WAIT", f"Only {evidence['sample']} comparable OOS trades"
-    if evidence["strength"]=="WEAK":
-        return "REJECT", f"Weak OOS edge: {evidence['expectancy']:+.2f}R expectancy, PF {evidence['pf']:.2f}"
-    if event_impact=="HIGH":
-        return "WAIT", "High-impact corporate event risk"
-    if row["Recommended Strategy"]=="INTRADAY STOCK" and not intraday_ok:
-        return "WAIT", "Daily setup exists but intraday entry is not confirmed"
-    if regime=="LONG BIAS" and row["Direction"]=="SHORT":
-        return "WAIT", "Short conflicts with broad-market regime"
-    if regime=="SHORT BIAS" and row["Direction"]=="LONG":
-        return "WAIT", "Long conflicts with broad-market regime"
-    if evidence["strength"]=="STRONG":
-        return "TRADE", "OOS evidence + current execution gates passed"
-    return "WAIT", "Historical edge is positive but robustness is not strong enough"
-
-def build_research_database(symbols, years=5, max_hold=20):
-    rg=historical_regime_series(max(2200,years*400+300))
-    all_bt=[]
-    for sym in symbols:
-        try:
-            z=backtest_symbol_v18(sym,55,years,max_hold,rg)
-            if len(z):all_bt.append(z)
-        except Exception:
-            pass
-    return pd.concat(all_bt,ignore_index=True) if all_bt else pd.DataFrame()
-
-
 # ==================== v1.5 UI ====================
 
-tab1,tab2,tab3,tab4,tab5,tab6,tab7 = st.tabs(
-    ["Today's Playbook","Evidence Scanner","My Tracked Trades","Zerodha Positions","Evidence Lab","Backtest Lab","Rules"]
+tab1,tab2,tab3,tab4,tab5,tab6 = st.tabs(
+    ["Today's Playbook","Scanner + Enter Trade","My Tracked Trades","Zerodha Positions","Backtest Lab","Rules"]
 )
 
 with tab1:
@@ -950,7 +731,7 @@ with tab2:
     risk=b.number_input("Risk per trade %",.25,2.0,1.0,.25,key="v15_risk")
     minscore=st.slider("Minimum underlying setup score",55,90,70,5,key="v15_min")
 
-    if st.button("Run ALPHA v1.8 Evidence Scanner",use_container_width=True):
+    if st.button("Run ALPHA v1.6.2 Strategy Scanner",use_container_width=True):
         scan_time=now_ist()
         regime,bias=nifty_regime()
         event_book=nse_event_book()
@@ -976,12 +757,6 @@ with tab2:
                         "OptionsScore":scores["OPTIONS"],"LongTermTechnical":scores["LONGTERM_TECH"],
                         "Recommended Strategy":strat,"BestScore":bestscore
                     })
-                    setup=live_setup_class(s,z["Direction"])
-                    evidence=comparable_evidence(st.session_state.get("alpha_research_bt",pd.DataFrame()),
-                                                 s,z["Direction"],setup,regime,z["Score"])
-                    verdict,verdict_reason=final_alpha_verdict(z,evidence,ok,impact,regime)
-                    z.update({"Setup Type":setup,"Evidence":evidence,"ALPHA Verdict":verdict,
-                              "Verdict Reason":verdict_reason})
                     rows.append(z)
             bar.progress((i+1)/len(SYMS))
         df=pd.DataFrame(rows)
@@ -992,30 +767,12 @@ with tab2:
         x=st.session_state.last_v15_scan
         df=x["df"]; regime=x["regime"]; exp=x["expiry"]
         st.write(f"**Market regime:** {regime} • **Scan:** {x['time'].strftime('%d-%b-%Y %I:%M:%S %p IST')} • **Expiry:** {exp['label']}")
-        actionable=df[(df.Score>=minscore)&(df["Recommended Strategy"]!="NO TRADE")].copy()
-        if "ALPHA Verdict" in actionable.columns:
-            order={"TRADE":0,"WAIT":1,"RESEARCH / WAIT":2,"REJECT":3}
-            actionable["_vorder"]=actionable["ALPHA Verdict"].map(order).fillna(9)
-            actionable=actionable.sort_values(["_vorder","BestScore"],ascending=[True,False]).head(5)
-        else:
-            actionable=actionable.sort_values("BestScore",ascending=False).head(5)
+        actionable=df[(df.Score>=minscore)&(df["Recommended Strategy"]!="NO TRADE")].sort_values("BestScore",ascending=False).head(5)
 
         if not len(actionable):
             st.warning("NO TRADE NOW — no strategy clears the current quality thresholds.")
         for idx,r in actionable.iterrows():
             st.markdown(f"### {r.Symbol} — {r['Recommended Strategy']} — {r.Direction}")
-            verdict=r.get("ALPHA Verdict","RESEARCH / WAIT")
-            if verdict=="TRADE": st.success(f"ALPHA VERDICT: TRADE — {r.get('Verdict Reason','')}")
-            elif verdict=="REJECT": st.error(f"ALPHA VERDICT: REJECT — {r.get('Verdict Reason','')}")
-            else: st.warning(f"ALPHA VERDICT: {verdict} — {r.get('Verdict Reason','')}")
-            st.write(f"**Setup:** {r.get('Setup Type','Unknown')}")
-            evd=r.get("Evidence")
-            if isinstance(evd,dict):
-                st.write(f"**OOS historical evidence:** {evd['strength']} • Comparable trades {evd['sample']} • "
-                         f"Win {evd['win_rate']:.1f}% • Expectancy {evd['expectancy']:+.2f}R • "
-                         f"PF {evd['pf']:.2f} • Max DD {evd['max_dd']:.1f}R • Match {evd['level']}")
-            else:
-                st.caption("No Evidence Lab database loaded yet; ALPHA will not call this evidence-validated.")
             st.write(
                 f"**Setup confidence (not historical win probability):** "
                 f"Intraday {confidence_label(r.IntradayScore)} {int(r.IntradayScore)}/100 • "
@@ -1039,10 +796,6 @@ with tab2:
                 else:
                     st.warning("Underlying/options setup scored well, but no tradable option contract passed the contract filters (expiry/strike/liquidity/quote checks). Do not force an options trade.")
 
-            if r.get("ALPHA Verdict")!="TRADE":
-                st.caption("Trade-entry journal is locked because the evidence/execution gates have not produced a TRADE verdict.")
-                st.divider()
-                continue
             with st.expander("I ENTERED THIS TRADE"):
                 actual=st.number_input("Actual entry price",min_value=.01,value=float(r.Entry),key=f"entry_{r.Symbol}_{idx}")
                 qty=st.number_input("Actual quantity",min_value=1,value=max(1,int(r.Qty)),key=f"qty_{r.Symbol}_{idx}")
@@ -1067,8 +820,8 @@ with tab2:
             st.divider()
 
         with st.expander("All strategy scores"):
-            cols=["Symbol","Direction","Setup Type","Score","IntradayScore","SwingScore","OptionsScore",
-                  "Recommended Strategy","ALPHA Verdict","Verdict Reason","15m checks","News / Event","Event impact"]
+            cols=["Symbol","Direction","Score","IntradayScore","SwingScore","OptionsScore","LongTermTechnical",
+                  "Recommended Strategy","15m checks","News / Event","Event impact"]
             st.dataframe(_safe_dataframe_view(df, cols, "BestScore", ascending=False),use_container_width=True,hide_index=True)
 
         st.caption("LongTermTechnical is only a technical suitability indicator. ALPHA will not call a stock a long-term investment until a fundamentals/valuation data layer is added.")
@@ -1130,76 +883,6 @@ with tab4:
         st.error(f"Could not read Zerodha positions: {e}")
 
 with tab5:
-    st.subheader("Evidence Lab — build OOS research database")
-    st.caption("Build this first. ALPHA uses the resulting historical research database as a gate in the live Evidence Scanner.")
-    c1,c2=st.columns(2)
-    ev_years=c1.selectbox("Research history",[3,4,5],index=2,key="ev_years")
-    ev_hold=c2.selectbox("Research max holding days",[10,15,20,30],index=2,key="ev_hold")
-    ev_syms=st.multiselect("Research universe",SYMS,default=SYMS,key="ev_syms")
-    st.info("The database is split chronologically: earlier ~70% is treated as development history and later ~30% as out-of-sample evidence. Live recommendations query the OOS portion only.")
-    if st.button("Build / refresh evidence database",use_container_width=True,key="build_evidence"):
-        prog=st.progress(0)
-        rg=historical_regime_series(max(2200,ev_years*400+300))
-        all_bt=[]
-        failures=[]
-        completed=0
-        for i,sym in enumerate(ev_syms):
-            try:
-                z=backtest_symbol_v18(sym,55,ev_years,ev_hold,rg)
-                completed += 1
-                if len(z):
-                    all_bt.append(z)
-                else:
-                    st.caption(f"{sym}: history fetched, but no qualifying research trades were produced.")
-            except Exception as e:
-                failures.append((sym, str(e)))
-                st.caption(f"{sym}: research unavailable — {str(e)[:160]}")
-            prog.progress((i+1)/max(len(ev_syms),1))
-
-        st.session_state.alpha_research_bt=pd.concat(all_bt,ignore_index=True) if all_bt else pd.DataFrame()
-
-        if all_bt:
-            st.success(
-                f"Evidence database refreshed • {completed}/{len(ev_syms)} symbols processed • "
-                f"{len(st.session_state.alpha_research_bt)} research trades created. "
-                "Re-run the Evidence Scanner so live candidates can be gated by OOS evidence."
-            )
-        elif failures:
-            st.error(
-                "Evidence database was NOT built because historical research failed. "
-                "Review the per-symbol errors above; ALPHA will keep live candidates at RESEARCH / WAIT."
-            )
-        else:
-            st.warning(
-                "Historical data was processed, but no qualifying research trades were produced "
-                "for the selected universe/settings."
-            )
-    research=st.session_state.get("alpha_research_bt",pd.DataFrame())
-    if len(research):
-        train,oos=_date_split(research,.70)
-        st.write(f"**Research signals:** {len(research)} • **Development portion:** {len(train)} • **OOS evidence portion:** {len(oos)}")
-        m=evidence_metrics(oos)
-        if m:
-            a,b,c,d,e=st.columns(5)
-            a.metric("OOS trades",m["Trades"]); b.metric("OOS expectancy",f"{m['Expectancy R']:+.2f}R")
-            c.metric("OOS PF",f"{m['Profit factor']:.2f}"); d.metric("OOS max DD",f"{m['Max drawdown R']:.1f}R")
-            e.metric("Positive-year share",f"{m['Positive year share']*100:.0f}%")
-        st.markdown("#### OOS by setup")
-        rows=[]
-        for name,g in oos.groupby("Setup"):
-            mm=evidence_metrics(g)
-            if mm: rows.append({"Setup":name,**mm})
-        st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
-        st.markdown("#### OOS by regime + direction")
-        rows=[]
-        for (rg,dr),g in oos.groupby(["Regime","Direction"]):
-            mm=evidence_metrics(g)
-            if mm: rows.append({"Regime":rg,"Direction":dr,**mm})
-        st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
-    else:
-        st.warning("No evidence database exists in this session yet. Until you build it, live candidates remain RESEARCH / WAIT.")
-
-with tab6:
     st.subheader("Historical Backtest Lab")
     st.caption("Walk-forward daily validation using Zerodha historical OHLC. Signals use only data known on the signal date; execution is modeled at the next day open.")
     c1,c2,c3=st.columns(3)
@@ -1244,17 +927,9 @@ with tab6:
     else:
         st.info("Choose stocks and run validation. No historical result is claimed until this test actually runs against your Zerodha data.")
 
-with tab7:
+with tab6:
     st.markdown("""
-### ALPHA v1.8 rules
-
-- **Evidence first:** a high technical score can no longer override weak out-of-sample historical evidence.
-- Build the **Evidence Lab** database first; the live scanner then queries comparable OOS setups.
-- Live candidates are classified as **TRADE / WAIT / RESEARCH-WAIT / REJECT**.
-- Evidence matching prefers same stock + direction + setup + regime, then relaxes only when the OOS sample is too small.
-- A STRONG evidence gate currently requires a meaningful sample plus positive expectancy, PF, drawdown and time-stability checks.
-- Trade-entry journaling is locked unless the final evidence/execution verdict is **TRADE**.
-- This remains decision-support, not a guarantee of profitability and not automatic order placement.
+### ALPHA v1.7 rules
 
 - The app knows the current India date, weekday and cash-market session.
 - Expiry is derived from Zerodha's current NFO instrument master instead of hard-coding a weekday.
@@ -1266,7 +941,6 @@ with tab7:
 - Long-term investing is not recommended from technicals alone. Fundamentals and valuation are still missing.
 - News/events remain an official-NSE event-risk layer; “None detected” is not proof that no relevant public news exists.
 - No automatic order placement.
-- The v1.8 Evidence Lab database is cached in Streamlit session memory in this build; rebuild it after a full app/session restart. This avoids silently treating stale research as current evidence.
 - The Backtest Lab validates the daily technical engine with next-session execution and conservative same-bar stop/target handling; it does not pretend to validate historical 15m/event/options layers without point-in-time data.
 
 ### Storage and options notes

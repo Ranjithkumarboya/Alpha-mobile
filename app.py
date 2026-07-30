@@ -1,152 +1,211 @@
 import streamlit as st
-import pandas as pd, numpy as np, yfinance as yf, sqlite3, json, hashlib
-from datetime import date, datetime
-from pathlib import Path
+import pandas as pd
+import numpy as np
+import yfinance as yf
+from datetime import date, timedelta
 
-st.set_page_config(page_title="ALPHA Mobile v0.6",page_icon="📈",layout="wide",initial_sidebar_state="collapsed")
-st.markdown("""<style>.block-container{padding-top:1rem;padding-bottom:4rem;max-width:1180px}.stButton button{width:100%;min-height:46px;border-radius:12px;font-weight:700}div[data-testid="stMetric"]{padding:10px;border-radius:12px;background:rgba(128,128,128,.08)}@media(max-width:700px){.block-container{padding-left:.6rem;padding-right:.6rem}h1{font-size:1.7rem!important}}</style>""",unsafe_allow_html=True)
-st.title("ALPHA Mobile v0.6")
-st.caption("Research database • walk-forward library • universe lab • forward paper journal")
+st.set_page_config(page_title="ALPHA Daily Scanner v1.0", page_icon="🎯", layout="wide", initial_sidebar_state="collapsed")
 
-DB=Path("alpha.db")
-def con(): return sqlite3.connect(DB,check_same_thread=False)
-def init():
-    c=con()
-    c.execute("""create table if not exists experiments(id text primary key,created text,ticker text,strategy text,params text,start text,end text,cost real,holdout_cagr real,holdout_dd real,holdout_sharpe real,status text)""")
-    c.execute("""create table if not exists paper_signals(id integer primary key autoincrement,run_time text,data_date text,ticker text,strategy text,params text,state text,close real)""")
-    c.commit();c.close()
-init()
+st.markdown("""
+<style>
+.block-container{padding-top:.8rem;padding-bottom:4rem;max-width:1150px}
+div[data-testid="stMetric"]{background:rgba(128,128,128,.08);padding:10px;border-radius:12px}
+.stButton button{width:100%;min-height:46px;border-radius:12px;font-weight:700}
+@media(max-width:700px){.block-container{padding-left:.65rem;padding-right:.65rem}h1{font-size:1.65rem!important}}
+</style>
+""", unsafe_allow_html=True)
 
-PRE={"NIFTY 50":"^NSEI","NIFTY BANK":"^NSEBANK","RELIANCE":"RELIANCE.NS","TCS":"TCS.NS","INFOSYS":"INFY.NS","HDFC BANK":"HDFCBANK.NS","ICICI BANK":"ICICIBANK.NS","SBIN":"SBIN.NS","ITC":"ITC.NS","TATA MOTORS":"TATAMOTORS.NS","MARUTI":"MARUTI.NS","LT":"LT.NS","SUN PHARMA":"SUNPHARMA.NS","BHARTI AIRTEL":"BHARTIARTL.NS"}
-NIFTY50_SAMPLE=["RELIANCE.NS","HDFCBANK.NS","ICICIBANK.NS","INFY.NS","TCS.NS","LT.NS","ITC.NS","SBIN.NS","BHARTIARTL.NS","MARUTI.NS","SUNPHARMA.NS","TATAMOTORS.NS"]
+st.title("🎯 ALPHA Daily Scanner v1.0")
+st.caption("End-of-day NSE swing scanner • ranks only qualifying setups • 0–5 picks")
 
-@st.cache_data(ttl=3600)
-def fetch(t,s,e):
-    x=yf.download(t,start=s,end=e,auto_adjust=True,progress=False,threads=False)
-    if isinstance(x.columns,pd.MultiIndex):x.columns=x.columns.get_level_values(0)
-    x.columns=[str(c).title() for c in x.columns]
+UNIVERSE = {
+"RELIANCE":"RELIANCE.NS","HDFC BANK":"HDFCBANK.NS","ICICI BANK":"ICICIBANK.NS",
+"INFOSYS":"INFY.NS","TCS":"TCS.NS","SBIN":"SBIN.NS","ITC":"ITC.NS",
+"LT":"LT.NS","BHARTI AIRTEL":"BHARTIARTL.NS","MARUTI":"MARUTI.NS",
+"SUN PHARMA":"SUNPHARMA.NS","TATA MOTORS":"TATAMOTORS.NS","AXIS BANK":"AXISBANK.NS",
+"KOTAK BANK":"KOTAKBANK.NS","BAJAJ FINANCE":"BAJFINANCE.NS","M&M":"M&M.NS",
+"NTPC":"NTPC.NS","POWER GRID":"POWERGRID.NS","TITAN":"TITAN.NS","ASIAN PAINTS":"ASIANPAINT.NS",
+"ULTRATECH":"ULTRACEMCO.NS","HCL TECH":"HCLTECH.NS","WIPRO":"WIPRO.NS",
+"TECH MAHINDRA":"TECHM.NS","ADANI PORTS":"ADANIPORTS.NS","ONGC":"ONGC.NS",
+"COAL INDIA":"COALINDIA.NS","TATA STEEL":"TATASTEEL.NS","JSW STEEL":"JSWSTEEL.NS",
+"GRASIM":"GRASIM.NS","CIPLA":"CIPLA.NS","DR REDDY":"DRREDDY.NS",
+"APOLLO HOSPITALS":"APOLLOHOSP.NS","EICHER MOTORS":"EICHERMOT.NS","HINDALCO":"HINDALCO.NS"
+}
+
+@st.cache_data(ttl=1800)
+def download_one(ticker):
+    end = date.today() + timedelta(days=1)
+    start = end - timedelta(days=550)
+    x = yf.download(ticker, start=start, end=end, auto_adjust=True, progress=False, threads=False)
+    if isinstance(x.columns, pd.MultiIndex):
+        x.columns = x.columns.get_level_values(0)
+    x.columns = [str(c).title() for c in x.columns]
     return x.dropna(subset=["Close"]).sort_index()
 
-def sig(df,s,p):
-    c=df.Close.astype(float)
-    if s=="Buy & Hold":return pd.Series(1.,index=df.index)
-    if s=="SMA Crossover":return (c.rolling(int(p["fast"])).mean()>c.rolling(int(p["slow"])).mean()).astype(float)
-    if s=="Donchian Breakout":
-        u=df.High.astype(float).shift(1).rolling(int(p["entry_lb"])).max();l=df.Low.astype(float).shift(1).rolling(int(p["exit_lb"])).min();pos=0;a=[]
-        for i in range(len(df)):
-            if pd.notna(u.iloc[i]) and c.iloc[i]>u.iloc[i]:pos=1
-            if pd.notna(l.iloc[i]) and c.iloc[i]<l.iloc[i]:pos=0
-            a.append(pos)
-        return pd.Series(a,index=df.index,dtype=float)
-    d=c.diff();g=d.clip(lower=0).ewm(alpha=1/int(p["rsi_n"]),adjust=False).mean();l=(-d.clip(upper=0)).ewm(alpha=1/int(p["rsi_n"]),adjust=False).mean();r=100-100/(1+g/l.replace(0,np.nan));pos=0;a=[]
-    for x in r:
-        if pd.notna(x) and x<float(p["entry"]):pos=1
-        elif pd.notna(x) and x>float(p["exit"]):pos=0
-        a.append(pos)
-    return pd.Series(a,index=df.index,dtype=float)
+def rsi(close, n=14):
+    d=close.diff()
+    gain=d.clip(lower=0).ewm(alpha=1/n,adjust=False).mean()
+    loss=(-d.clip(upper=0)).ewm(alpha=1/n,adjust=False).mean()
+    return 100-(100/(1+gain/loss.replace(0,np.nan)))
 
-def run(df,s,p,cap,cost):
-    sg=sig(df,s,p);r=df.Close.astype(float).pct_change().fillna(0);pos=sg.shift(1).fillna(0);chg=pos.diff().fillna(pos);sr=pos*r-chg.abs()*cost/10000
-    eq=cap*(1+sr).cumprod();dd=eq/eq.cummax()-1;yrs=max((df.index[-1]-df.index[0]).days/365.25,1/365.25);cg=(eq.iloc[-1]/cap)**(1/yrs)-1;v=sr.std()*np.sqrt(252);sh=sr.mean()*252/v if v>0 else np.nan
-    return {"returns":sr,"eq":eq,"cagr":cg,"dd":float(dd.min()),"sharpe":sh,"signal":sg,"close":float(df.Close.iloc[-1])}
+def atr(df,n=14):
+    prev=df.Close.shift(1)
+    tr=pd.concat([(df.High-df.Low).abs(),(df.High-prev).abs(),(df.Low-prev).abs()],axis=1).max(axis=1)
+    return tr.rolling(n).mean()
 
-def candidates(s,p):
-    if s=="SMA Crossover":
-        fs=sorted(set([max(2,int(p["fast"]*.75)),int(p["fast"]),int(p["fast"]*1.25)]));ss=sorted(set([max(3,int(p["slow"]*.8)),int(p["slow"]),int(p["slow"]*1.2)]))
-        return [{"fast":f,"slow":q} for f in fs for q in ss if f<q]
-    if s=="Donchian Breakout":
-        es=sorted(set([max(5,int(p["entry_lb"]*.75)),int(p["entry_lb"]),int(p["entry_lb"]*1.25)]));xs=sorted(set([max(3,int(p["exit_lb"]*.75)),int(p["exit_lb"]),int(p["exit_lb"]*1.25)]))
-        return [{"entry_lb":e,"exit_lb":x} for e in es for x in xs]
-    return [{"rsi_n":n,"entry":e,"exit":p["exit"]} for n in sorted(set([max(2,p["rsi_n"]-3),p["rsi_n"],p["rsi_n"]+3])) for e in sorted(set([max(10,p["entry"]-5),p["entry"],min(45,p["entry"]+5)]))]
+def analyze(name,ticker,capital,risk_pct,min_score):
+    try:
+        d=download_one(ticker)
+    except:
+        return None
+    if len(d)<220:
+        return None
 
-def ui_params(s,key):
-    if s=="SMA Crossover":
-        a,b=st.columns(2);return {"fast":a.number_input("Fast SMA",2,200,20,key="f"+key),"slow":b.number_input("Slow SMA",3,500,100,key="s"+key)}
-    if s=="Donchian Breakout":
-        a,b=st.columns(2);return {"entry_lb":a.number_input("Entry lookback",2,250,55,key="e"+key),"exit_lb":b.number_input("Exit lookback",2,250,20,key="x"+key)}
-    a,b,c=st.columns(3);return {"rsi_n":a.number_input("RSI period",2,100,14,key="r"+key),"entry":b.number_input("Entry RSI",1,49,30,key="i"+key),"exit":c.number_input("Exit RSI",40,99,50,key="o"+key)}
+    c=d.Close.astype(float); h=d.High.astype(float); l=d.Low.astype(float)
+    v=d.Volume.astype(float) if "Volume" in d else pd.Series(index=d.index,dtype=float)
 
-def save_exp(t,s,p,start,end,cost,m,status):
-    raw=f"{t}{s}{p}{start}{end}{datetime.utcnow().isoformat()}";eid=hashlib.sha1(raw.encode()).hexdigest()[:10]
-    c=con();c.execute("insert into experiments values(?,?,?,?,?,?,?,?,?,?,?,?)",(eid,datetime.utcnow().isoformat(),t,s,json.dumps(p),str(start),str(end),cost,m["cagr"],m["dd"],None if pd.isna(m["sharpe"]) else float(m["sharpe"]),status));c.commit();c.close()
+    sma20=c.rolling(20).mean()
+    sma50=c.rolling(50).mean()
+    sma200=c.rolling(200).mean()
+    rs=rsi(c)
+    at=atr(d)
+    high20=h.shift(1).rolling(20).max()
+    vol20=v.rolling(20).mean()
 
-tabs=st.tabs(["Validation Lab","Strategy Library","Universe Lab","Forward Paper","Database","Method"])
+    px=float(c.iloc[-1]); atrv=float(at.iloc[-1]) if pd.notna(at.iloc[-1]) else 0
+    r=float(rs.iloc[-1]) if pd.notna(rs.iloc[-1]) else 50
 
-with tabs[0]:
-    name=st.selectbox("Instrument",list(PRE));ticker=PRE[name];a,b=st.columns(2);start=a.date_input("Start",date(2012,1,1));end=b.date_input("End",date.today())
-    s=st.selectbox("Strategy",["SMA Crossover","Donchian Breakout","RSI Mean Reversion"]);p=ui_params(s,"v")
-    a,b,c=st.columns(3);br=a.number_input("Brokerage bps",0.,100.,3.,.5);fees=b.number_input("Taxes/fees bps",0.,100.,5.,.5);sl=c.number_input("Slippage bps",0.,100.,5.,.5);cost=br+fees+sl
-    hold=st.slider("Final untouched holdout %",20,40,30,5);trainy=st.slider("WF training years",2,8,4);testm=st.slider("WF test months",3,12,6,3)
-    if st.button("Validate & Save"):
-        d=fetch(ticker,start,end)
-        if len(d)<700:st.error("Need more history.")
-        else:
-            cut=int(len(d)*(1-hold/100));dev=d.iloc[:cut];ho=d.iloc[cut:];hm=run(ho,s,p,100000,cost)
-            wf=[];cur=dev.index.min()+pd.DateOffset(years=trainy)
-            while cur<dev.index.max():
-                tr=dev[(dev.index>=cur-pd.DateOffset(years=trainy))&(dev.index<cur)];te1=min(cur+pd.DateOffset(months=testm),dev.index.max());te=dev[(dev.index>=cur)&(dev.index<=te1)]
-                if len(tr)>250 and len(te)>30:
-                    bestp=p;best=-999
-                    for cp in candidates(s,p):
-                        m=run(tr,s,cp,100000,cost);sc=(-999 if pd.isna(m["sharpe"]) else m["sharpe"]-.5*abs(m["dd"]))
-                        if sc>best:best=sc;bestp=cp
-                    tm=run(te,s,bestp,100000,cost);wf.append([cur.date(),te1.date(),str(bestp),tm["cagr"],tm["dd"],tm["sharpe"]])
-                cur=te1
-            w=pd.DataFrame(wf,columns=["Start","End","Params","CAGR","Max DD","Sharpe"])
-            pos=(w.CAGR>0).mean() if len(w) else 0
-            status="PAPER CANDIDATE" if hm["cagr"]>0 and pd.notna(hm["sharpe"]) and hm["sharpe"]>=.5 and hm["dd"]>-.35 and pos>=.6 else "REJECT"
-            a,b,c=st.columns(3);a.metric("Holdout CAGR",f"{hm['cagr']:.2%}");b.metric("Holdout DD",f"{hm['dd']:.2%}");c.metric("WF positive windows",f"{pos:.1%}")
-            st.dataframe(w,use_container_width=True);st.success(status) if status=="PAPER CANDIDATE" else st.error(status)
-            save_exp(ticker,s,p,start,end,cost,hm,status);st.info("Experiment saved to ALPHA database.")
+    score=0
+    reasons=[]
 
-with tabs[1]:
-    st.subheader("Walk-forward strategy library")
-    st.write("The library is the history of validated experiments—not a leaderboard of highest CAGR.")
-    c=con();df=pd.read_sql_query("select * from experiments order by created desc",c);c.close()
-    if len(df):
-        st.dataframe(df[["created","ticker","strategy","params","holdout_cagr","holdout_dd","holdout_sharpe","status"]],use_container_width=True)
-        good=df[df.status=="PAPER CANDIDATE"];st.metric("Paper candidates",len(good))
-    else:st.info("No saved experiments yet.")
+    if px > sma200.iloc[-1]:
+        score += 20; reasons.append("Above 200-DMA")
+    if sma20.iloc[-1] > sma50.iloc[-1] > sma200.iloc[-1]:
+        score += 20; reasons.append("20/50/200 trend aligned")
+    elif sma50.iloc[-1] > sma200.iloc[-1]:
+        score += 10; reasons.append("Medium-term trend positive")
 
-with tabs[2]:
-    st.subheader("Universe Lab")
-    st.warning("This built-in list is a CURRENT-stock sample, not survivorship-bias-free historical NIFTY membership. Do not use it to claim historical stock-selection alpha.")
-    s=st.selectbox("Universe strategy",["SMA Crossover","Donchian Breakout","RSI Mean Reversion"],key="us");p=ui_params(s,"u")
-    if st.button("Scan research universe"):
+    breakout = pd.notna(high20.iloc[-1]) and px > float(high20.iloc[-1])
+    near_breakout = pd.notna(high20.iloc[-1]) and px >= float(high20.iloc[-1]) * .985
+    if breakout:
+        score += 25; reasons.append("20-day breakout")
+    elif near_breakout:
+        score += 12; reasons.append("Near 20-day breakout")
+
+    if 50 <= r <= 68:
+        score += 15; reasons.append(f"Healthy RSI {r:.0f}")
+    elif 45 <= r < 50:
+        score += 7
+    elif r > 75:
+        score -= 10; reasons.append("RSI stretched")
+
+    vol_ratio=np.nan
+    if len(v) and pd.notna(vol20.iloc[-1]) and vol20.iloc[-1]>0:
+        vol_ratio=float(v.iloc[-1]/vol20.iloc[-1])
+        if vol_ratio >= 1.5:
+            score += 15; reasons.append(f"Volume {vol_ratio:.1f}× avg")
+        elif vol_ratio >= 1.1:
+            score += 8; reasons.append("Volume confirmation")
+
+    mom20=float(c.iloc[-1]/c.iloc[-21]-1) if len(c)>21 else 0
+    if mom20 > .05:
+        score += 10; reasons.append(f"20D momentum {mom20:.1%}")
+    elif mom20 > 0:
+        score += 5
+
+    score=max(0,min(100,score))
+
+    # ATR-based research levels for next-session planning
+    entry=px
+    stop=max(px-1.5*atrv, float(sma20.iloc[-1]) if pd.notna(sma20.iloc[-1]) else px-1.5*atrv)
+    risk_per_share=max(entry-stop, .01)
+    target1=entry+1.5*risk_per_share
+    target2=entry+2.5*risk_per_share
+    rupees_risk=capital*(risk_pct/100)
+    qty=int(rupees_risk/risk_per_share) if risk_per_share>0 else 0
+    max_cash_qty=int(capital/entry) if entry>0 else 0
+    qty=max(0,min(qty,max_cash_qty))
+
+    qualified = score >= min_score and px > sma200.iloc[-1] and r < 75
+    return {
+        "Stock":name,"Ticker":ticker,"Score":int(score),"Close":round(px,2),
+        "RSI":round(r,1),"Volume x":None if pd.isna(vol_ratio) else round(vol_ratio,2),
+        "20D %":round(mom20*100,2),"Entry zone":round(entry,2),"Stop":round(stop,2),
+        "Target 1":round(target1,2),"Target 2":round(target2,2),"Qty":qty,
+        "Risk ₹":round(qty*risk_per_share,0),"Qualified":qualified,
+        "Why":" • ".join(reasons[:5]),"Data date":str(d.index[-1].date())
+    }
+
+tab1,tab2,tab3=st.tabs(["Today's Picks","Stock Detail","Rules"])
+
+with tab1:
+    st.subheader("Daily Top Opportunities")
+    st.info("Run this after market close for next-session swing planning. The app may return fewer than 5 stocks.")
+    a,b=st.columns(2)
+    capital=a.number_input("Trading capital (₹)",min_value=10000,value=100000,step=10000)
+    risk=b.number_input("Max risk per idea (%)",min_value=.25,max_value=3.0,value=1.0,step=.25)
+    min_score=st.slider("Minimum ALPHA score",50,90,65,5)
+    max_picks=st.slider("Maximum picks",1,5,5)
+
+    if st.button("Scan NSE Universe"):
+        bar=st.progress(0)
         rows=[]
-        for t in NIFTY50_SAMPLE:
-            try:d=fetch(t,date(2018,1,1),date.today())
-            except:continue
-            if len(d)>500:
-                m=run(d,s,p,100000,13);rows.append([t,m["cagr"],m["dd"],m["sharpe"],int(m["signal"].iloc[-1])])
-        st.dataframe(pd.DataFrame(rows,columns=["Ticker","CAGR","Max DD","Sharpe","Current state"]),use_container_width=True)
+        items=list(UNIVERSE.items())
+        for i,(name,ticker) in enumerate(items):
+            r=analyze(name,ticker,float(capital),float(risk),int(min_score))
+            if r: rows.append(r)
+            bar.progress((i+1)/len(items))
+        df=pd.DataFrame(rows)
+        if df.empty:
+            st.error("Market data could not be loaded.")
+        else:
+            picks=df[df.Qualified].sort_values(["Score","20D %"],ascending=False).head(max_picks)
+            if picks.empty:
+                st.warning("NO TRADE / NO QUALIFYING SETUPS. ALPHA will not force five picks.")
+            else:
+                st.success(f"{len(picks)} setup(s) passed today's filter.")
+                for rank,(_,r) in enumerate(picks.iterrows(),1):
+                    st.markdown(f"### #{rank} {r['Stock']} — {r['Score']}/100")
+                    a,b,c=st.columns(3)
+                    a.metric("Close",f"₹{r['Close']:,.2f}")
+                    b.metric("Stop",f"₹{r['Stop']:,.2f}")
+                    c.metric("Qty",f"{int(r['Qty'])}")
+                    st.write(f"**Planning levels:** Entry around ₹{r['Entry zone']:,.2f} | T1 ₹{r['Target 1']:,.2f} | T2 ₹{r['Target 2']:,.2f}")
+                    st.write(f"**Why:** {r['Why']}")
+                    st.caption(f"Data: {r['Data date']} • Estimated position risk: ₹{r['Risk ₹']:,.0f}")
+                    st.divider()
 
-with tabs[3]:
-    st.subheader("Forward paper-trading journal")
-    s=st.selectbox("Paper strategy",["SMA Crossover","Donchian Breakout","RSI Mean Reversion"],key="ps");p=ui_params(s,"p")
-    names=st.multiselect("Paper universe",list(PRE),default=["NIFTY 50","NIFTY BANK","RELIANCE","HDFC BANK","INFOSYS"])
-    if st.button("Record today's paper states"):
-        c=con();n=0
-        for name in names:
-            t=PRE[name]
-            try:d=fetch(t,date(2022,1,1),date.today())
-            except:continue
-            if len(d)>100:
-                sg=sig(d,s,p);now=int(sg.iloc[-1]);prev=int(sg.iloc[-2]);state="NEW ENTRY" if now and not prev else ("IN" if now else ("NEW EXIT" if prev else "OUT"))
-                c.execute("insert into paper_signals(run_time,data_date,ticker,strategy,params,state,close) values(?,?,?,?,?,?,?)",(datetime.utcnow().isoformat(),str(d.index[-1].date()),t,s,json.dumps(p),state,float(d.Close.iloc[-1])));n+=1
-        c.commit();c.close();st.success(f"Recorded {n} paper observations.")
-    c=con();pj=pd.read_sql_query("select * from paper_signals order by id desc limit 500",c);c.close()
-    if len(pj):st.dataframe(pj,use_container_width=True)
+                st.subheader("Ranking table")
+                show=["Stock","Score","Close","RSI","Volume x","20D %","Entry zone","Stop","Target 1","Target 2","Qty","Risk ₹","Data date"]
+                st.dataframe(picks[show],use_container_width=True,hide_index=True)
+                st.download_button("Download today's shortlist CSV",picks.to_csv(index=False),file_name="alpha_daily_picks.csv",mime="text/csv")
 
-with tabs[4]:
-    st.subheader("Database backup")
-    st.write("Streamlit Community Cloud local disk is not durable infrastructure. Download backups regularly; production should move this database to managed Postgres.")
-    if DB.exists():st.download_button("Download alpha.db backup",DB.read_bytes(),file_name="alpha.db",mime="application/octet-stream")
-    if st.button("Clear cache (not database)"):st.cache_data.clear();st.success("Market-data cache cleared.")
+            with st.expander("See all scanned stocks"):
+                st.dataframe(df.sort_values("Score",ascending=False),use_container_width=True,hide_index=True)
 
-with tabs[5]:
-    st.markdown("""**What v0.6 changes:** research results and forward paper observations are persisted in SQLite; walk-forward results feed a strategy library; a current-stock universe lab is separated from historical claims; and the app explicitly labels survivorship bias.
+with tab2:
+    st.subheader("Inspect one stock")
+    name=st.selectbox("Stock",list(UNIVERSE.keys()),key="detail")
+    if st.button("Analyze Stock"):
+        r=analyze(name,UNIVERSE[name],100000,1.0,65)
+        d=download_one(UNIVERSE[name])
+        if r:
+            st.metric("ALPHA score",f"{r['Score']}/100")
+            st.write(r["Why"])
+            st.line_chart(d.Close.tail(180))
+            st.json({k:v for k,v in r.items() if k not in ["Why","Qualified"]})
 
-**Data-source reality:** Yahoo Finance remains a convenience source. For serious deployment, replace it with a licensed/official market-data source.  
-**Database reality:** SQLite on free cloud hosting can disappear on restart/redeploy. Download backups; production needs managed Postgres.  
-**Execution:** still deliberately disabled. Forward paper evidence should accumulate before broker integration.""")
+with tab3:
+    st.markdown("""
+**Current scoring model**
+- Long-term trend: price vs 200-DMA
+- Trend alignment: 20/50/200-DMA
+- 20-day breakout / near-breakout
+- RSI quality filter
+- Volume confirmation
+- 20-day momentum
+- ATR-based stop and risk-sized quantity
+
+**Important:** this is an end-of-day swing scanner, not an intraday prediction engine. Entry/stop/targets are mechanical planning levels based on the latest available daily candle, not guaranteed prices.
+""")
+    st.warning("Do not buy a stock merely because it ranks #1. Gap-ups, news, liquidity and next-session price action can invalidate the setup. This version is for paper trading/controlled research first.")

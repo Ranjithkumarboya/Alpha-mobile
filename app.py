@@ -28,8 +28,8 @@ def _safe_dataframe_view(df, requested_cols=None, sort_col=None, ascending=False
     return out
 
 
-st.set_page_config(page_title="ALPHA Live v1.6.2", page_icon="🎯", layout="wide", initial_sidebar_state="collapsed")
-st.title("🎯 ALPHA Live v1.6.2")
+st.set_page_config(page_title="ALPHA Live v1.7", page_icon="🎯", layout="wide", initial_sidebar_state="collapsed")
+st.title("🎯 ALPHA Live v1.7")
 st.caption("Live Zerodha decision-support • technicals + 15m confirmation + NSE corporate events • manual execution")
 
 try:
@@ -589,10 +589,118 @@ def get_underlying_ltp(sym):
         return None
 
 
+
+# ==================== v1.7 Historical Validation Layer ====================
+
+def _score_at_bar(d, i):
+    """Rebuild the daily setup using only information available at bar i (no look-ahead)."""
+    if i < 200 or i >= len(d):
+        return None
+    x=d.iloc[:i+1].copy()
+    c=x.Close.astype(float); h=x.High.astype(float); lo=x.Low.astype(float); v=x.Volume.astype(float)
+    s20=c.rolling(20).mean(); s50=c.rolling(50).mean(); s200=c.rolling(200).mean()
+    rv=float(rsi(c).iloc[-1]); av=float(atr(x).iloc[-1])
+    if not np.isfinite(rv) or not np.isfinite(av) or av <= 0: return None
+    px=float(c.iloc[-1])
+    hi=float(h.shift(1).rolling(20).max().iloc[-1]); low20=float(lo.shift(1).rolling(20).min().iloc[-1])
+    volavg=float(v.rolling(20).mean().iloc[-1]); vr=float(v.iloc[-1]/volavg) if volavg>0 else 0
+    mom=float(px/c.iloc[-21]-1)
+    long=0; short=0
+    if px>s200.iloc[-1]: long+=20
+    if px<s200.iloc[-1]: short+=20
+    if s20.iloc[-1]>s50.iloc[-1]>s200.iloc[-1]: long+=20
+    if s20.iloc[-1]<s50.iloc[-1]<s200.iloc[-1]: short+=20
+    if px>hi: long+=25
+    elif px>=hi*.985: long+=12
+    if px<low20: short+=25
+    elif px<=low20*1.015: short+=12
+    if 50<=rv<=68: long+=15
+    if 32<=rv<=50: short+=15
+    if rv>75: long-=10
+    if rv<25: short-=10
+    if vr>=1.5:
+        if mom>=0: long+=15
+        else: short+=15
+    elif vr>=1.1:
+        if mom>=0: long+=8
+        else: short+=8
+    if mom>.05: long+=10
+    elif mom>0: long+=5
+    if mom<-.05: short+=10
+    elif mom<0: short+=5
+    long=max(0,min(100,long)); short=max(0,min(100,short))
+    direction='LONG' if long>=short else 'SHORT'; score=max(long,short)
+    if direction=='LONG':
+        stop=max(px-1.5*av,float(s20.iloc[-1])); risk=max(px-stop,.01)
+        t1=px+1.5*risk; t2=px+2.5*risk
+    else:
+        stop=min(px+1.5*av,float(s20.iloc[-1])); risk=max(stop-px,.01)
+        t1=px-1.5*risk; t2=px-2.5*risk
+    return {'direction':direction,'score':int(score),'entry':px,'stop':float(stop),'t1':float(t1),'t2':float(t2),'risk':risk}
+
+def _walk_forward_trade(d, signal_i, sig, max_hold=20):
+    """Enter next daily open. Conservative rule: if stop and target touch in same bar, stop wins."""
+    entry_i=signal_i+1
+    if entry_i>=len(d): return None
+    entry=float(d.Open.iloc[entry_i]); risk=float(sig['risk'])
+    if risk<=0: return None
+    # Preserve signal-day risk distance but anchor levels to executable next-open entry.
+    if sig['direction']=='LONG':
+        stop=entry-risk; t1=entry+1.5*risk; t2=entry+2.5*risk
+    else:
+        stop=entry+risk; t1=entry-1.5*risk; t2=entry-2.5*risk
+    end=min(len(d)-1,entry_i+max_hold-1); t1_hit=False
+    for j in range(entry_i,end+1):
+        hi=float(d.High.iloc[j]); lo=float(d.Low.iloc[j])
+        if sig['direction']=='LONG':
+            if lo<=stop: return j,-1.0,'SL'
+            if hi>=t2: return j,2.5,'T2'
+            if hi>=t1: t1_hit=True
+        else:
+            if hi>=stop: return j,-1.0,'SL'
+            if lo<=t2: return j,2.5,'T2'
+            if lo<=t1: t1_hit=True
+    exit_px=float(d.Close.iloc[end])
+    r=((exit_px-entry)/risk) if sig['direction']=='LONG' else ((entry-exit_px)/risk)
+    # T1 is recorded as evidence, but unresolved trades exit at max-hold close to avoid invented fills.
+    return end,float(r),'TIME'+(' / T1 TOUCHED' if t1_hit else '')
+
+def backtest_symbol(sym, min_score=70, years=3, max_hold=20):
+    days=max(550,int(years*365)+260)
+    d=hist(sym,'day',days)
+    if len(d)<230: return pd.DataFrame()
+    d=d.copy().dropna(subset=['Open','High','Low','Close'])
+    start=max(200,len(d)-int(years*252)-max_hold-5)
+    rows=[]; next_free=start
+    for i in range(start,len(d)-1):
+        if i<next_free: continue
+        sig=_score_at_bar(d,i)
+        if not sig or sig['score']<min_score: continue
+        out=_walk_forward_trade(d,i,sig,max_hold)
+        if not out: continue
+        exit_i,r,outcome=out
+        rows.append({'Symbol':sym,'Signal Date':str(pd.to_datetime(d.index[i]).date()),
+                     'Entry Date':str(pd.to_datetime(d.index[i+1]).date()),'Direction':sig['direction'],
+                     'Score':sig['score'],'R':round(r,3),'Outcome':outcome,
+                     'Exit Date':str(pd.to_datetime(d.index[exit_i]).date())})
+        next_free=exit_i+1
+    return pd.DataFrame(rows)
+
+def backtest_metrics(bt):
+    if bt is None or bt.empty: return None
+    r=pd.to_numeric(bt['R'],errors='coerce').dropna()
+    if not len(r): return None
+    eq=r.cumsum(); peak=eq.cummax(); dd=eq-peak
+    gross_win=float(r[r>0].sum()); gross_loss=abs(float(r[r<0].sum()))
+    return {'Trades':len(r),'Win rate %':float((r>0).mean()*100),'Expectancy R':float(r.mean()),
+            'Profit factor':(gross_win/gross_loss if gross_loss>0 else np.inf),
+            'Net R':float(r.sum()),'Max drawdown R':float(dd.min())}
+
+
 # ==================== v1.5 UI ====================
 
-tab1,tab2,tab3,tab4,tab5 = st.tabs(
-    ["Today's Playbook","Scanner + Enter Trade","My Tracked Trades","Zerodha Positions","Rules"]
+tab1,tab2,tab3,tab4,tab5,tab6 = st.tabs(
+    ["Today's Playbook","Scanner + Enter Trade","My Tracked Trades","Zerodha Positions","Backtest Lab","Rules"]
 )
 
 with tab1:
@@ -775,8 +883,53 @@ with tab4:
         st.error(f"Could not read Zerodha positions: {e}")
 
 with tab5:
+    st.subheader("Historical Backtest Lab")
+    st.caption("Walk-forward daily validation using Zerodha historical OHLC. Signals use only data known on the signal date; execution is modeled at the next day open.")
+    c1,c2,c3=st.columns(3)
+    bt_years=c1.selectbox("History",[1,2,3,4,5],index=2,key="bt_years")
+    bt_score=c2.slider("Minimum historical score",55,90,70,5,key="bt_score")
+    bt_hold=c3.selectbox("Maximum holding days",[5,10,15,20,30],index=3,key="bt_hold")
+    bt_syms=st.multiselect("Stocks to validate",SYMS,default=SYMS[:10],key="bt_syms")
+    st.warning("This validates the DAILY technical engine, not the live 15-minute confirmation, NSE-event filter, or option-premium logic. Mixing those into this result without point-in-time historical data would create fake precision.")
+    if st.button("Run historical validation",use_container_width=True,key="run_bt"):
+        all_bt=[]; prog=st.progress(0)
+        for i,sym in enumerate(bt_syms):
+            try:
+                z=backtest_symbol(sym,bt_score,bt_years,bt_hold)
+                if len(z): all_bt.append(z)
+            except Exception as e:
+                st.caption(f"{sym}: backtest unavailable — {str(e)[:100]}")
+            prog.progress((i+1)/max(len(bt_syms),1))
+        st.session_state.alpha_bt=pd.concat(all_bt,ignore_index=True) if all_bt else pd.DataFrame()
+    bt=st.session_state.get("alpha_bt",pd.DataFrame())
+    if len(bt):
+        m=backtest_metrics(bt)
+        a,b,c,d,e,f=st.columns(6)
+        a.metric("Trades",m['Trades']); b.metric("Win rate",f"{m['Win rate %']:.1f}%")
+        c.metric("Expectancy",f"{m['Expectancy R']:+.2f}R"); d.metric("Profit factor",f"{m['Profit factor']:.2f}")
+        e.metric("Net result",f"{m['Net R']:+.1f}R"); f.metric("Max drawdown",f"{m['Max drawdown R']:.1f}R")
+        if m['Trades']<50: st.warning("Sample is small. Do not treat this as proof of an edge yet.")
+        elif m['Expectancy R']<=0 or m['Profit factor']<=1: st.error("The tested daily engine has not demonstrated a positive historical edge under these assumptions.")
+        else: st.success("The tested daily engine shows positive historical expectancy under these assumptions. It still needs out-of-sample/live validation before risking meaningful capital.")
+        st.markdown("#### By direction")
+        direction_rows=[]
+        for name,g in bt.groupby('Direction'):
+            mm=backtest_metrics(g); direction_rows.append({'Direction':name,**mm})
+        st.dataframe(pd.DataFrame(direction_rows),use_container_width=True,hide_index=True)
+        st.markdown("#### By score band")
+        tmp=bt.copy(); tmp['Score band']=pd.cut(tmp.Score,[54,64,69,74,79,84,100],labels=['55-64','65-69','70-74','75-79','80-84','85+'])
+        score_rows=[]
+        for name,g in tmp.groupby('Score band',observed=True):
+            mm=backtest_metrics(g); score_rows.append({'Score band':str(name),**mm})
+        st.dataframe(pd.DataFrame(score_rows),use_container_width=True,hide_index=True)
+        with st.expander("All historical simulated trades"):
+            st.dataframe(bt.sort_values('Signal Date',ascending=False),use_container_width=True,hide_index=True)
+    else:
+        st.info("Choose stocks and run validation. No historical result is claimed until this test actually runs against your Zerodha data.")
+
+with tab6:
     st.markdown("""
-### ALPHA v1.5 rules
+### ALPHA v1.7 rules
 
 - The app knows the current India date, weekday and cash-market session.
 - Expiry is derived from Zerodha's current NFO instrument master instead of hard-coding a weekday.
@@ -788,6 +941,7 @@ with tab5:
 - Long-term investing is not recommended from technicals alone. Fundamentals and valuation are still missing.
 - News/events remain an official-NSE event-risk layer; “None detected” is not proof that no relevant public news exists.
 - No automatic order placement.
+- The Backtest Lab validates the daily technical engine with next-session execution and conservative same-bar stop/target handling; it does not pretend to validate historical 15m/event/options layers without point-in-time data.
 
 ### Storage and options notes
 - v1.6 stores tracked trades in a local SQLite database rather than session state, so normal page refreshes and app reruns keep the trades.

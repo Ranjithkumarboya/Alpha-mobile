@@ -1,13 +1,14 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 from zoneinfo import ZoneInfo
 import requests
+import sqlite3
 from kiteconnect import KiteConnect
 
-st.set_page_config(page_title="ALPHA Live v1.4", page_icon="🎯", layout="wide", initial_sidebar_state="collapsed")
-st.title("🎯 ALPHA Live v1.4")
+st.set_page_config(page_title="ALPHA Live v1.6", page_icon="🎯", layout="wide", initial_sidebar_state="collapsed")
+st.title("🎯 ALPHA Live v1.6")
 st.caption("Live Zerodha decision-support • technicals + 15m confirmation + NSE corporate events • manual execution")
 
 try:
@@ -327,18 +328,285 @@ def intraday_confirm(sym, direction):
     except Exception as e:
         return False, "15m confirmation unavailable", 0, [str(e)[:100]]
 
-tab1,tab2,tab3,tab4=st.tabs(["Market + Setups","Trade Calculator","Position Monitor","Rules"])
+
+# ==================== v1.5 Strategy + Calendar + Tracked Trade Layer ====================
+
+TRADE_STORE = "alpha_trades.json"
+
+def now_ist():
+    return datetime.now(IST)
+
+def market_clock():
+    n = now_ist()
+    wd = n.strftime("%A")
+    mins = n.hour * 60 + n.minute
+    is_weekday = n.weekday() < 5
+    if not is_weekday:
+        session = "CLOSED / WEEKEND"
+    elif mins < 9*60+15:
+        session = "PRE-MARKET / BEFORE CASH SESSION"
+    elif mins <= 15*60+30:
+        session = "MARKET OPEN"
+    else:
+        session = "MARKET CLOSED"
+    return n, wd, session
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def nfo_instruments():
+    try:
+        return pd.DataFrame(kite.instruments("NFO"))
+    except Exception:
+        return pd.DataFrame()
+
+def expiry_context(underlying=None):
+    """
+    Uses live Zerodha NFO instrument master rather than hard-coding weekday expiry rules.
+    This automatically adapts when exchange expiry conventions change.
+    """
+    df = nfo_instruments()
+    if df.empty or "expiry" not in df.columns:
+        return {"label":"UNAVAILABLE","dte":None,"expiry":None,"note":"NFO instrument master unavailable"}
+    x = df.copy()
+    x["expiry"] = pd.to_datetime(x["expiry"], errors="coerce").dt.date
+    x = x[x["expiry"].notna()]
+    today = now_ist().date()
+    x = x[x["expiry"] >= today]
+    if underlying and "name" in x.columns:
+        ux = x[x["name"].astype(str).str.upper() == underlying.upper()]
+        if len(ux): x = ux
+    if not len(x):
+        return {"label":"NO CONTRACT","dte":None,"expiry":None,"note":"No future expiry found"}
+    exp = min(x["expiry"])
+    dte = (exp - today).days
+    if dte == 0: label = "EXPIRY DAY"
+    elif dte == 1: label = "1 DAY TO EXPIRY"
+    elif dte <= 3: label = "NEAR EXPIRY"
+    else: label = f"{dte} DAYS TO EXPIRY"
+    return {"label":label,"dte":dte,"expiry":exp,"note":f"Nearest NFO expiry: {exp}"}
+
+def confidence_label(score):
+    if score >= 85: return "VERY HIGH"
+    if score >= 75: return "HIGH"
+    if score >= 65: return "MEDIUM"
+    return "LOW"
+
+def strategy_scores(row, intraday_passed, event_impact, regime, expiry):
+    """
+    These are SETUP QUALITY scores, not win probabilities.
+    They are intentionally displayed as confidence until validated outcome history exists.
+    """
+    base = int(row["Score"])
+    direction = row["Direction"]
+    regime_bonus = 0
+    if regime == "LONG BIAS" and direction == "LONG": regime_bonus = 7
+    elif regime == "SHORT BIAS" and direction == "SHORT": regime_bonus = 7
+    elif regime == "SELECTIVE": regime_bonus = -3
+    elif regime == "UNKNOWN": regime_bonus = -8
+
+    event_penalty = {"HIGH":10,"MEDIUM":5,"LOW":2,"NONE":0}.get(event_impact,0)
+    intra = max(0,min(100, base + (12 if intraday_passed else -12) + regime_bonus - event_penalty))
+    swing = max(0,min(100, base + regime_bonus - round(event_penalty*.7)))
+
+    # Options buying requires a stronger underlying setup and intraday timing.
+    option = base + (15 if intraday_passed else -18) + regime_bonus - event_penalty
+    if expiry.get("dte") is not None:
+        if expiry["dte"] == 0: option -= 12
+        elif expiry["dte"] <= 2: option -= 7
+        elif expiry["dte"] >= 4: option += 3
+    option = max(0,min(100,option))
+
+    # Long-term is deliberately NOT called a true investment score because fundamentals are absent.
+    longterm_technical = max(0,min(100, base + (8 if direction=="LONG" else -20) - event_penalty))
+    return {"INTRADAY":intra,"SWING":swing,"OPTIONS":option,"LONGTERM_TECH":longterm_technical}
+
+def choose_strategy(scores, direction, expiry):
+    # Do not recommend options merely because leverage is available.
+    eligible = {
+        "INTRADAY STOCK": scores["INTRADAY"] if scores["INTRADAY"] >= 78 else -1,
+        "SWING STOCK": scores["SWING"] if scores["SWING"] >= 72 and direction=="LONG" else -1,
+        "OPTION BUY": scores["OPTIONS"] if scores["OPTIONS"] >= 88 else -1,
+    }
+    best = max(eligible, key=eligible.get)
+    if eligible[best] < 0:
+        return "NO TRADE"
+    return best
+
+def option_contract_hint(sym, direction, ltp, expiry):
+    """
+    Selects a liquid-ish near-ATM contract from Zerodha's live NFO instrument master.
+    This is a contract candidate, not an options valuation model.
+    """
+    df = nfo_instruments()
+    if df.empty or expiry.get("expiry") is None:
+        return None
+    x = df.copy()
+    x["expiry"] = pd.to_datetime(x["expiry"], errors="coerce").dt.date
+    if "name" not in x.columns or "instrument_type" not in x.columns:
+        return None
+    opt_type = "CE" if direction=="LONG" else "PE"
+    x = x[(x["name"].astype(str).str.upper()==sym.upper()) &
+          (x["expiry"]==expiry["expiry"]) &
+          (x["instrument_type"].astype(str).str.upper()==opt_type)]
+    if not len(x): return None
+    x["strike_dist"] = (pd.to_numeric(x["strike"], errors="coerce") - float(ltp)).abs()
+    x = x.sort_values("strike_dist")
+    r = x.iloc[0]
+    return {"tradingsymbol":r.get("tradingsymbol"),"strike":float(r.get("strike",0)),
+            "type":opt_type,"expiry":str(r.get("expiry")),"lot_size":int(r.get("lot_size",1))}
+
+def _db():
+    # Local SQLite persistence. Survives normal reruns/restarts on a stable host,
+    # but Streamlit Community Cloud can replace the filesystem on redeploy.
+    path = Path("/tmp/alpha_trades.db")
+    con = sqlite3.connect(path, check_same_thread=False)
+    con.execute("""CREATE TABLE IF NOT EXISTS trades(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT, direction TEXT, strategy TEXT, entry REAL, qty INTEGER,
+        stop REAL, t1 REAL, t2 REAL, entered_at TEXT, status TEXT,
+        original_score INTEGER, expiry TEXT, event_at_entry TEXT,
+        option_symbol TEXT, option_entry REAL, option_qty INTEGER,
+        exit_price REAL, exit_time TEXT, exit_reason TEXT
+    )""")
+    con.commit()
+    return con
+
+def _load_trades():
+    con=_db()
+    df=pd.read_sql_query("SELECT * FROM trades ORDER BY id DESC",con)
+    con.close()
+    return df.to_dict("records") if len(df) else []
+
+def _save_trade(t):
+    con=_db()
+    cols=["symbol","direction","strategy","entry","qty","stop","t1","t2","entered_at","status",
+          "original_score","expiry","event_at_entry","option_symbol","option_entry","option_qty"]
+    vals=[t.get(c) for c in cols]
+    con.execute(f"INSERT INTO trades ({','.join(cols)}) VALUES ({','.join(['?']*len(cols))})",vals)
+    con.commit();con.close()
+
+def _close_trade(trade_id, exit_price, reason):
+    con=_db()
+    con.execute("UPDATE trades SET status='CLOSED',exit_price=?,exit_time=?,exit_reason=? WHERE id=?",
+                (float(exit_price),now_ist().isoformat(),reason,int(trade_id)))
+    con.commit();con.close()
+
+def option_live_snapshot(option_symbol):
+    if not option_symbol:return None
+    try:
+        q=kite.quote([f"NFO:{option_symbol}"])[f"NFO:{option_symbol}"]
+        depth=q.get("depth",{})
+        buy=depth.get("buy",[]) or []; sell=depth.get("sell",[]) or []
+        bid=float(buy[0]["price"]) if buy else np.nan
+        ask=float(sell[0]["price"]) if sell else np.nan
+        ltp=float(q.get("last_price",0))
+        oi=float(q.get("oi",0) or 0)
+        vol=float(q.get("volume",0) or 0)
+        spread=(ask-bid) if np.isfinite(bid) and np.isfinite(ask) else np.nan
+        spread_pct=(spread/ltp*100) if ltp>0 and np.isfinite(spread) else np.nan
+        return {"ltp":ltp,"bid":bid,"ask":ask,"spread":spread,"spread_pct":spread_pct,"oi":oi,"volume":vol}
+    except Exception:
+        return None
+
+def option_management(t, underlying_ltp):
+    snap=option_live_snapshot(t.get("option_symbol"))
+    base_action,r=trade_monitor_decision_underlying(t,underlying_ltp)
+    if not snap:return base_action,r,None
+    prem_entry=float(t.get("option_entry") or 0)
+    prem=snap["ltp"]
+    prem_ret=(prem/prem_entry-1) if prem_entry>0 else 0
+    exp=datetime.fromisoformat(t["expiry"]).date() if t.get("expiry") else None
+    dte=(exp-now_ist().date()).days if exp else None
+
+    # Premium-aware risk management. This does not fabricate Greeks/IV.
+    if prem_entry>0 and prem <= prem_entry*.70:
+        action="EXIT — OPTION PREMIUM RISK LIMIT"
+    elif prem_entry>0 and prem >= prem_entry*1.50:
+        action="PARTIAL EXIT / TRAIL OPTION PROFIT"
+    elif dte is not None and dte<=0 and now_ist().time() >= time(14,45):
+        action="EXIT REVIEW — EXPIRY / THETA RISK"
+    elif snap.get("spread_pct") is not None and np.isfinite(snap["spread_pct"]) and snap["spread_pct"]>2:
+        action="TIGHTEN RISK — OPTION SPREAD WIDE"
+    else:
+        action=base_action
+    return action,r,{"snapshot":snap,"premium_return":prem_ret,"dte":dte}
+
+def trade_monitor_decision_underlying(t, ltp):
+    direction=t["direction"]; entry=float(t["entry"]); stop=float(t["stop"])
+    t1=float(t["t1"]); t2=float(t["t2"]); strategy=t["strategy"]
+    risk=max(abs(entry-stop),0.01)
+    if direction=="LONG":
+        r=(ltp-entry)/risk
+        if ltp <= stop:return "EXIT — STOP/INVALIDATION",r
+        if ltp >= t2:return "PROTECT PROFIT / EXIT REMAINDER",r
+        if ltp >= t1:return "PARTIAL EXIT / TRAIL STOP",r
+    else:
+        r=(entry-ltp)/risk
+        if ltp >= stop:return "EXIT — STOP/INVALIDATION",r
+        if ltp <= t2:return "PROTECT PROFIT / EXIT REMAINDER",r
+        if ltp <= t1:return "PARTIAL EXIT / TRAIL STOP",r
+    if strategy=="INTRADAY STOCK":
+        ok,msg,passed,failed=intraday_confirm(t["symbol"],direction)
+        if not ok and r<0:return "EXIT / REDUCE REVIEW — INTRADAY SETUP WEAK",r
+        if passed<3:return "TIGHTEN RISK / WATCH",r
+    elif strategy=="SWING STOCK":
+        z=score_stock(t["symbol"],ltp,100000,1)
+        if z and (z["Direction"]!=direction or z["Score"]<60):
+            return "EXIT / REDUCE REVIEW — SWING THESIS WEAK",r
+    if r>=1:return "HOLD / PROTECT PROFIT",r
+    return "HOLD / MANAGE",r
+
+def trade_monitor_decision(t, ltp):
+    if t["strategy"]=="OPTION BUY":
+        return option_management(t,ltp)
+    action,r=trade_monitor_decision_underlying(t,ltp)
+    return action,r,None
+
+def get_underlying_ltp(sym):
+    try:
+        return float(kite.ltp([f"NSE:{sym}"])[f"NSE:{sym}"]["last_price"])
+    except Exception:
+        return None
+
+
+# ==================== v1.5 UI ====================
+
+tab1,tab2,tab3,tab4,tab5 = st.tabs(
+    ["Today's Playbook","Scanner + Enter Trade","My Tracked Trades","Zerodha Positions","Rules"]
+)
 
 with tab1:
-    a,b=st.columns(2)
-    capital=a.number_input("Trading capital (₹)",10000,100000000,100000,10000)
-    risk=b.number_input("Risk per trade (%)",.25,2.0,1.0,.25)
-    minscore=st.slider("Minimum setup score",55,90,70,5)
+    n, weekday, session = market_clock()
+    exp = expiry_context()
+    st.subheader("ALPHA Today's Playbook")
+    c1,c2,c3 = st.columns(3)
+    c1.metric("Trading day", f"{weekday} • {n.strftime('%d %b %Y')}")
+    c2.metric("Cash market", session)
+    c3.metric("Expiry context", exp["label"])
+    st.caption(exp["note"])
+    st.info("ALPHA does not assume expiry day = option-buying day. Near expiry makes the options filter stricter.")
 
-    if st.button("Run ALPHA Live Decision Engine",use_container_width=True):
-        scan_time = datetime.now(IST)
+    if "last_v15_scan" in st.session_state:
+        x=st.session_state.last_v15_scan
+        df=x["df"]
+        if len(df):
+            best=df.sort_values("BestScore",ascending=False).iloc[0]
+            st.markdown(f"### Best current opportunity: {best.Symbol} • {best['Recommended Strategy']} • {best.Direction}")
+            st.write(f"**Setup confidence:** {confidence_label(best.BestScore)} ({int(best.BestScore)}/100)")
+            st.write(f"Intraday {int(best.IntradayScore)}/100 • Swing {int(best.SwingScore)}/100 • Options {int(best.OptionsScore)}/100")
+    else:
+        st.caption("Run the scanner once to generate today's strategy playbook.")
+
+with tab2:
+    a,b=st.columns(2)
+    capital=a.number_input("Trading capital ₹",10000,100000000,100000,10000,key="v15_cap")
+    risk=b.number_input("Risk per trade %",.25,2.0,1.0,.25,key="v15_risk")
+    minscore=st.slider("Minimum underlying setup score",55,90,70,5,key="v15_min")
+
+    if st.button("Run ALPHA v1.5 Strategy Scanner",use_container_width=True):
+        scan_time=now_ist()
         regime,bias=nifty_regime()
-        event_book = nse_event_book()
+        event_book=nse_event_book()
+        exp=expiry_context()
         q=kite.ltp([f"NSE:{s}" for s in SYMS])
         rows=[]
         bar=st.progress(0)
@@ -348,156 +616,163 @@ with tab1:
                 z=score_stock(s,float(q[k]["last_price"]),capital,risk)
                 if z:
                     ok,msg,passed,failed=intraday_confirm(s,z["Direction"])
-                    z["15m Confirm"]=ok
-                    z["15m checks"]=f"{passed}/4"
-                    z["Intraday note"]=msg
-                    z["15m failed"]=" • ".join(failed) if failed else "None"
-                    ev,impact,ev_items=stock_event_summary(s,event_book)
-                    z["News / Event"]=ev
-                    z["Event impact"]=impact
-                    z["_event_items"]=ev_items
+                    ev,impact,items=stock_event_summary(s,event_book)
+                    scores=strategy_scores(z,ok,impact,regime,exp)
+                    strat=choose_strategy(scores,z["Direction"],exp)
+                    bestscore=max(scores["INTRADAY"],scores["SWING"],scores["OPTIONS"])
+                    z.update({
+                        "15m Confirm":ok,"15m checks":f"{passed}/4",
+                        "15m failed":" • ".join(failed) if failed else "None",
+                        "News / Event":ev,"Event impact":impact,
+                        "IntradayScore":scores["INTRADAY"],"SwingScore":scores["SWING"],
+                        "OptionsScore":scores["OPTIONS"],"LongTermTechnical":scores["LONGTERM_TECH"],
+                        "Recommended Strategy":strat,"BestScore":bestscore
+                    })
                     rows.append(z)
             bar.progress((i+1)/len(SYMS))
         df=pd.DataFrame(rows)
-        if not len(df):
-            st.error("No market data returned."); st.stop()
+        st.session_state.last_v15_scan={"df":df,"time":scan_time,"regime":regime,"expiry":exp}
+        st.rerun()
 
-        # Separate daily setup quality from intraday timing.
-        score_qualified = df[df.Score >= minscore].copy()
-        confirmed = score_qualified[score_qualified["15m Confirm"] == True].copy()
+    if "last_v15_scan" in st.session_state:
+        x=st.session_state.last_v15_scan
+        df=x["df"]; regime=x["regime"]; exp=x["expiry"]
+        st.write(f"**Market regime:** {regime} • **Scan:** {x['time'].strftime('%d-%b-%Y %I:%M:%S %p IST')} • **Expiry:** {exp['label']}")
+        actionable=df[(df.Score>=minscore)&(df["Recommended Strategy"]!="NO TRADE")].sort_values("BestScore",ascending=False).head(5)
 
-        # High-impact official corporate events raise the quality threshold.
-        if len(confirmed):
-            confirmed = confirmed[
-                confirmed.apply(
-                    lambda r: r.Score >= event_risk_adjustment(r.Direction, minscore, r["Event impact"]),
-                    axis=1
-                )
-            ]
+        if not len(actionable):
+            st.warning("NO TRADE NOW — no strategy clears the current quality thresholds.")
+        for idx,r in actionable.iterrows():
+            st.markdown(f"### {r.Symbol} — {r['Recommended Strategy']} — {r.Direction}")
+            st.write(
+                f"**Setup confidence (not historical win probability):** "
+                f"Intraday {confidence_label(r.IntradayScore)} {int(r.IntradayScore)}/100 • "
+                f"Swing {confidence_label(r.SwingScore)} {int(r.SwingScore)}/100 • "
+                f"Options {confidence_label(r.OptionsScore)} {int(r.OptionsScore)}/100"
+            )
+            c1,c2,c3=st.columns(3)
+            c1.metric("Entry reference",f"₹{r.Entry:,.2f}")
+            c2.metric("Stop",f"₹{r.Stop:,.2f}")
+            c3.metric("Qty",int(r.Qty))
+            st.write(f"**T1:** ₹{r['T1']:,.2f} • **T2:** ₹{r['T2']:,.2f} • **Planned SL risk:** ~₹{r['Planned loss ₹']:,.0f}")
+            st.write(f"**News / Event:** {r['News / Event']} • Risk: {r['Event impact']}")
+            st.write(f"**15m:** {r['15m checks']} • Failed: {r['15m failed']}")
+            st.caption(f"Underlying evidence: {r.Why}")
 
-        candidates = confirmed.copy()
-        if regime == "LONG BIAS":
-            candidates = candidates[(candidates.Direction=="LONG") | (candidates.Score>=85)]
-        elif regime == "SHORT BIAS":
-            candidates = candidates[(candidates.Direction=="SHORT") | (candidates.Score>=85)]
-        elif regime == "UNKNOWN":
-            candidates = candidates[candidates.Score >= max(minscore, 80)]
+            if r["Recommended Strategy"]=="OPTION BUY":
+                oc=option_contract_hint(r.Symbol,r.Direction,r["Live LTP"],exp)
+                if oc:
+                    st.write(f"**Option candidate:** {oc['tradingsymbol']} • {oc['type']} • Strike {oc['strike']:.0f} • Expiry {oc['expiry']} • Lot {oc['lot_size']}")
+                    st.warning("Contract selection is preliminary: v1.5 does not yet model IV/Greeks or option-premium stop/target, so do not treat this as a fully validated options entry.")
+                else:
+                    st.warning("No matching option contract candidate resolved; do not force an options trade.")
 
-        longs=candidates[candidates.Direction=="LONG"]
-        shorts=candidates[candidates.Direction=="SHORT"]
-        breadth=(df.Direction=="LONG").mean()
+            with st.expander("I ENTERED THIS TRADE"):
+                actual=st.number_input("Actual entry price",min_value=.01,value=float(r.Entry),key=f"entry_{r.Symbol}_{idx}")
+                qty=st.number_input("Actual quantity",min_value=1,value=max(1,int(r.Qty)),key=f"qty_{r.Symbol}_{idx}")
+                option_symbol=None; option_entry=None; option_qty=None
+                if r["Recommended Strategy"]=="OPTION BUY":
+                    oc2=option_contract_hint(r.Symbol,r.Direction,r["Live LTP"],exp)
+                    default_opt=oc2["tradingsymbol"] if oc2 else ""
+                    option_symbol=st.text_input("Actual option contract",value=default_opt,key=f"optsym_{r.Symbol}_{idx}")
+                    option_entry=st.number_input("Actual option premium paid",min_value=0.01,value=1.0,key=f"optentry_{r.Symbol}_{idx}")
+                    option_qty=st.number_input("Actual option quantity",min_value=1,value=(oc2["lot_size"] if oc2 else 1),key=f"optqty_{r.Symbol}_{idx}")
+                if st.button("Save entered trade",key=f"save_{r.Symbol}_{idx}"):
+                    _save_trade({
+                        "symbol":r.Symbol,"direction":r.Direction,"strategy":r["Recommended Strategy"],
+                        "entry":float(actual),"qty":int(qty),"stop":float(r.Stop),"t1":float(r["T1"]),"t2":float(r["T2"]),
+                        "entered_at":now_ist().isoformat(),"status":"OPEN","original_score":int(r.Score),
+                        "expiry":str(exp["expiry"]) if r["Recommended Strategy"]=="OPTION BUY" and exp.get("expiry") else None,
+                        "event_at_entry":r["News / Event"],
+                        "option_symbol":option_symbol,"option_entry":float(option_entry) if option_entry else None,
+                        "option_qty":int(option_qty) if option_qty else None
+                    })
+                    st.success("Trade saved. Open 'My Tracked Trades' and refresh the app for live HOLD/EXIT guidance.")
+            st.divider()
 
-        if len(candidates):
-            if regime=="SELECTIVE" or (0.4 < breadth < 0.6):
-                day="🟡 SELECTIVE — CONFIRMED SETUPS ONLY"
-            elif regime=="UNKNOWN":
-                day="🟠 MARKET REGIME UNKNOWN — EXTRA CAUTION"
-            else:
-                day="🟢 TRADEABLE NOW — FOLLOW RISK RULES"
-        elif len(score_qualified):
-            day="🟠 WAIT — DAILY SETUPS EXIST, 15m CONFIRMATION MISSING"
-        elif regime=="SELECTIVE" and int((df.Score>=60).sum()) <= 2:
-            day="🔴 AVOID NEW TRADES NOW — WEAK OPPORTUNITY SET"
-        else:
-            day="⚪ NO SETUP NOW — STAY IN CASH"
+        with st.expander("All strategy scores"):
+            cols=["Symbol","Direction","Score","IntradayScore","SwingScore","OptionsScore","LongTermTechnical",
+                  "Recommended Strategy","15m checks","News / Event","Event impact"]
+            st.dataframe(df[cols].sort_values("BestScore",ascending=False),use_container_width=True,hide_index=True)
 
-        st.caption(f"Scan time: {scan_time.strftime('%d-%b-%Y %I:%M:%S %p IST')} • Re-scan after a fresh 15-minute candle, not every few seconds.")
-        st.subheader(day)
-        st.write(f"**Market regime:** {regime} | **Qualified LONG:** {len(longs)} | **Qualified SHORT:** {len(shorts)}")
-        picks=candidates.sort_values("Score",ascending=False).head(5)
-
-        if len(picks):
-            for _,r in picks.iterrows():
-                icon="🟢" if r.Direction=="LONG" else "🔴"
-                st.markdown(f"### {icon} {r.Symbol} — {r.Direction} — {r.Score}/100")
-                c1,c2,c3=st.columns(3)
-                c1.metric("Entry reference",f"₹{r.Entry:,.2f}")
-                c2.metric("Stop",f"₹{r.Stop:,.2f}")
-                c3.metric("Qty",f"{int(r.Qty)}")
-                st.write(f"**T1:** ₹{r['T1']:,.2f} → profit if hit ≈ ₹{r['Profit if T1 ₹']:,.0f}  |  **T2:** ₹{r['T2']:,.2f} → profit if hit ≈ ₹{r['Profit if T2 ₹']:,.0f}")
-                st.write(f"**Planned loss near SL:** ₹{r['Planned loss ₹']:,.0f} | **R:R:** T1 {r['R:R T1']} • T2 {r['R:R T2']}")
-                st.write(f"**Strategy evidence:** {r.Why}")
-                impact_icon = {"HIGH":"🔴","MEDIUM":"🟠","LOW":"🟡","NONE":"⚪"}.get(r["Event impact"], "⚪")
-                st.write(f'**News / Event:** {impact_icon} {r["News / Event"]} | **Event risk:** {r["Event impact"]}')
-                st.write(f'**15m confirmation:** {r["15m checks"]} passed')
-                if r["15m failed"] != "None":
-                    st.caption(f'15m failed checks: {r["15m failed"]}')
-                if r.Direction=="SHORT":
-                    st.caption("SHORT = intraday cash-equity research signal only. Confirm broker product/eligibility and square-off rules before execution.")
-                st.divider()
-        else:
-            st.warning("ALPHA found no setup meeting the current filters. Staying in cash is the strategy.")
-
-        waiting = score_qualified[score_qualified["15m Confirm"] == False].sort_values("Score", ascending=False)
-        if len(waiting):
-            with st.expander("Why strong daily setups are still WAITING"):
-                st.dataframe(
-                    waiting[["Symbol","Direction","Score","15m checks","15m failed","News / Event","Event impact"]],
-                    use_container_width=True, hide_index=True
-                )
-
-        with st.expander("Full scanner"):
-            visible = [c for c in df.columns if c != "_event_items"]
-            st.dataframe(df[visible].sort_values("Score",ascending=False),use_container_width=True,hide_index=True)
-
-with tab2:
-    st.subheader("Exact risk / reward calculator")
-    direction=st.radio("Direction",["LONG","SHORT"],horizontal=True)
-    entry=st.number_input("Entry price",min_value=.01,value=1000.0)
-    stop=st.number_input("Stop-loss",min_value=.01,value=980.0 if direction=="LONG" else 1020.0)
-    target=st.number_input("Target",min_value=.01,value=1040.0 if direction=="LONG" else 960.0)
-    qty=st.number_input("Quantity",min_value=1,value=10)
-    riskps=(entry-stop) if direction=="LONG" else (stop-entry)
-    rewardps=(target-entry) if direction=="LONG" else (entry-target)
-    if riskps<=0 or rewardps<=0:
-        st.error("Entry/SL/target geometry is invalid for this direction.")
-    else:
-        c1,c2,c3=st.columns(3)
-        c1.metric("Planned loss",f"₹{riskps*qty:,.0f}")
-        c2.metric("Profit if target hits",f"₹{rewardps*qty:,.0f}")
-        c3.metric("Risk : Reward",f"1 : {rewardps/riskps:.2f}")
+        st.caption("LongTermTechnical is only a technical suitability indicator. ALPHA will not call a stock a long-term investment until a fundamentals/valuation data layer is added.")
 
 with tab3:
-    st.subheader("Live Zerodha positions")
+    st.subheader("My Tracked Trades")
+    st.caption("Refresh the page/app to pull fresh Zerodha prices and recalculate management guidance.")
+    trades=_load_trades()
+    open_count=0
+    for t in trades:
+        if t.get("status")!="OPEN": continue
+        open_count+=1
+        ltp=get_underlying_ltp(t["symbol"])
+        st.markdown(f"### {t['symbol']} • {t['strategy']} • {t['direction']}")
+        st.write(f"Entered: {t['entered_at']} • Entry ₹{t['entry']:,.2f} • Qty {t['qty']}")
+        if ltp is None:
+            st.error("Could not fetch current underlying LTP.")
+            continue
+        action,r_mult,optmeta=trade_monitor_decision(t,ltp)
+        pnl=(ltp-t["entry"])*t["qty"] if t["direction"]=="LONG" else (t["entry"]-ltp)*t["qty"]
+        c1,c2,c3=st.columns(3)
+        c1.metric("Current underlying",f"₹{ltp:,.2f}")
+        c2.metric("Approx underlying P&L",f"₹{pnl:,.0f}")
+        c3.metric("R multiple",f"{r_mult:+.2f}R")
+        st.subheader(action)
+        st.write(f"Original SL ₹{t['stop']:,.2f} • T1 ₹{t['t1']:,.2f} • T2 ₹{t['t2']:,.2f}")
+        if t["strategy"]=="OPTION BUY":
+            if optmeta and optmeta.get("snapshot"):
+                s=optmeta["snapshot"]
+                st.write(f"**Option:** {t.get('option_symbol')} • Premium ₹{s['ltp']:,.2f} • Entry premium ₹{float(t.get('option_entry') or 0):,.2f}")
+                st.write(f"**Option P&L %:** {optmeta['premium_return']*100:+.1f}% • OI {s['oi']:,.0f} • Volume {s['volume']:,.0f}")
+                if np.isfinite(s.get("spread_pct",np.nan)):
+                    st.write(f"**Bid/Ask:** ₹{s['bid']:,.2f} / ₹{s['ask']:,.2f} • Spread {s['spread_pct']:.2f}%")
+                st.caption("Premium, liquidity and expiry are monitored live. IV/Greeks are not fabricated because Kite quote data does not directly provide them.")
+            else:
+                st.warning("Could not fetch the saved NFO option contract. Underlying-thesis management only.")
+        reason=st.text_input("Exit note (optional)",key=f"reason_{t['id']}")
+        if st.button("Mark trade CLOSED at current underlying price",key=f"close_{t['id']}"):
+            _close_trade(t["id"],ltp,reason or action)
+            st.rerun()
+        st.divider()
+    if open_count==0:
+        st.info("No manually tracked open trades in this active Streamlit session.")
+
+    closed=[t for t in trades if t.get("status")=="CLOSED"]
+    if closed:
+        with st.expander("Closed tracked trades"):
+            st.dataframe(pd.DataFrame(closed),use_container_width=True,hide_index=True)
+
+with tab4:
+    st.subheader("Live Zerodha Positions")
     try:
         pos=kite.positions().get("net",[])
         live=[p for p in pos if p.get("quantity",0)!=0]
-        if not live:
-            st.info("No open net positions detected.")
+        if not live: st.info("No open net positions detected.")
         for p in live:
-            sym=p["tradingsymbol"]; qty=p["quantity"]; avg=float(p["average_price"])
-            try:
-                ltp=float(kite.ltp([f"NSE:{sym}"])[f"NSE:{sym}"]["last_price"])
-                z=score_stock(sym,ltp,100000,1.0)
-            except: z=None; ltp=0
-            pnl=(ltp-avg)*qty
-            st.markdown(f"### {sym} • Qty {qty}")
-            c1,c2=st.columns(2);c1.metric("Live LTP",f"₹{ltp:,.2f}");c2.metric("Approx P&L",f"₹{pnl:,.0f}")
-            if z:
-                held_dir="LONG" if qty>0 else "SHORT"
-                if held_dir==z["Direction"] and z["Score"]>=70:
-                    action="HOLD / MANAGE"
-                elif z["Score"]<60 or held_dir!=z["Direction"]:
-                    action="EXIT / REDUCE REVIEW"
-                else: action="TIGHTEN RISK / WATCH"
-                st.write(f"**ALPHA:** {action} | Current model: {z['Direction']} {z['Score']}/100")
-            st.divider()
+            st.write(f"**{p.get('tradingsymbol')}** • Qty {p.get('quantity')} • Avg ₹{float(p.get('average_price',0)):,.2f} • P&L ₹{float(p.get('pnl',0)):,.0f}")
     except Exception as e:
-        st.error(f"Could not read positions: {e}")
+        st.error(f"Could not read Zerodha positions: {e}")
 
-with tab4:
+with tab5:
     st.markdown("""
-**v1.4 logic**
-- Separate LONG and SHORT scores using daily trend, breakout/breakdown, RSI, volume and momentum.
-- NIFTY regime uses the Kite NIFTY 50 index token fallback and reports **UNKNOWN** if regime data cannot be established.
-- 15-minute timing is transparent: EMA20, session VWAP, latest candle direction and relative volume; 3/4 are required.
-- A strong daily setup without 15m confirmation becomes **WAIT**, not automatically “BAD TRADE TODAY”.
-- Official NSE corporate announcements, board meetings and corporate actions are attached next to matching stocks when the feed is reachable.
-- HIGH-impact corporate events raise the minimum technical quality required; the app does **not** guess that an event is bullish or bearish from keywords.
-- “None detected” means no matching item was returned by the current event feed; it does not prove that no relevant public news exists anywhere.
-- Profit figures remain scenario values **if targets hit**, not guaranteed or statistically expected profit.
+### ALPHA v1.5 rules
+
+- The app knows the current India date, weekday and cash-market session.
+- Expiry is derived from Zerodha's current NFO instrument master instead of hard-coding a weekday.
+- Every stock gets separate **Intraday / Swing / Options** setup-quality scores.
+- These numbers are **NOT win probabilities**. Real win probability will only be displayed after enough completed strategy-specific trades exist.
+- Options require a substantially higher threshold than stock trades, and near-expiry conditions make the filter stricter.
+- **I ENTERED THIS TRADE** records the actual entry and changes the workflow from scanning to position management.
+- Tracked trades use strategy-specific HOLD / PROTECT PROFIT / PARTIAL EXIT / EXIT logic on refresh.
+- Long-term investing is not recommended from technicals alone. Fundamentals and valuation are still missing.
+- News/events remain an official-NSE event-risk layer; “None detected” is not proof that no relevant public news exists.
 - No automatic order placement.
-- General media/news sentiment is intentionally not fabricated. A licensed/reliable news API is required before that layer should influence trading decisions.
+
+### Storage and options notes
+- v1.6 stores tracked trades in a local SQLite database rather than session state, so normal page refreshes and app reruns keep the trades.
+- Streamlit Community Cloud can still replace its local filesystem during redeploy/rebuild. Truly durable cloud persistence requires an external database; the app cannot guarantee that with local SQLite alone.
+- OPTION BUY trades now monitor the **actual saved NFO contract premium**, bid/ask spread, volume, OI, expiry context and the underlying thesis.
+- ALPHA does **not fabricate IV or Greeks**. Kite's standard quote response does not directly supply a full Greeks/IV model; a proper option analytics model/data source is required before those are used for decisions.
 """)
     if st.button("Logout Zerodha session"):
         st.session_state.pop("access_token",None);st.rerun()

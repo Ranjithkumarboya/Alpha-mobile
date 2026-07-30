@@ -6,9 +6,10 @@ from zoneinfo import ZoneInfo
 import requests
 import sqlite3
 from kiteconnect import KiteConnect
+from pathlib import Path
 
-st.set_page_config(page_title="ALPHA Live v1.6", page_icon="🎯", layout="wide", initial_sidebar_state="collapsed")
-st.title("🎯 ALPHA Live v1.6")
+st.set_page_config(page_title="ALPHA Live v1.6.1", page_icon="🎯", layout="wide", initial_sidebar_state="collapsed")
+st.title("🎯 ALPHA Live v1.6.1")
 st.caption("Live Zerodha decision-support • technicals + 15m confirmation + NSE corporate events • manual execution")
 
 try:

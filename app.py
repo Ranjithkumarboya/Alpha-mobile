@@ -28,8 +28,8 @@ def _safe_dataframe_view(df, requested_cols=None, sort_col=None, ascending=False
     return out
 
 
-st.set_page_config(page_title="ALPHA Live v1.7", page_icon="🎯", layout="wide", initial_sidebar_state="collapsed")
-st.title("🎯 ALPHA Live v1.7")
+st.set_page_config(page_title="ALPHA Live v1.8.2", page_icon="🎯", layout="wide", initial_sidebar_state="collapsed")
+st.title("🎯 ALPHA Live v1.8.2")
 st.caption("Live Zerodha decision-support • technicals + 15m confirmation + NSE corporate events • manual execution")
 
 try:
@@ -590,7 +590,7 @@ def get_underlying_ltp(sym):
 
 
 
-# ==================== v1.7 Historical Validation Layer ====================
+# ==================== v1.8.2 Historical Validation + Evidence Gate ====================
 
 def _score_at_bar(d, i):
     """Rebuild the daily setup using only information available at bar i (no look-ahead)."""
@@ -697,6 +697,104 @@ def backtest_metrics(bt):
             'Net R':float(r.sum()),'Max drawdown R':float(dd.min())}
 
 
+@st.cache_data(ttl=21600, show_spinner=False)
+def build_evidence_database(years=5, min_score=70, max_hold=20):
+    """
+    Historical DAILY-engine evidence only.
+    Cached to avoid rebuilding on every scan. This does not pretend to validate
+    15m/event/options layers for which point-in-time historical inputs are absent.
+    """
+    frames = []
+    for sym in SYMS:
+        try:
+            z = backtest_symbol(sym, min_score=min_score, years=years, max_hold=max_hold)
+            if z is not None and len(z):
+                frames.append(z)
+        except Exception:
+            pass
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+def evidence_summary(bt, direction=None, min_live_score=None):
+    if bt is None or bt.empty:
+        return None
+    x = bt.copy()
+    if direction:
+        x = x[x["Direction"] == direction]
+    if min_live_score is not None:
+        # Use a score neighbourhood rather than cherry-picking the exact score.
+        floor = max(55, int(min_live_score) - 5)
+        x = x[pd.to_numeric(x["Score"], errors="coerce") >= floor]
+    return backtest_metrics(x) if len(x) else None
+
+def evidence_gate(direction, live_score, evidence_bt):
+    """
+    Conservative live gate based on DAILY historical evidence.
+    It can block a setup; it cannot validate the live 15m/event/options components.
+    """
+    m = evidence_summary(evidence_bt, direction=direction, min_live_score=live_score)
+    if not m:
+        return False, "NO MATCHING EVIDENCE", None
+    if m["Trades"] < 50:
+        return False, f"INSUFFICIENT SAMPLE ({m['Trades']} trades)", m
+    if m["Expectancy R"] <= 0:
+        return False, f"NEGATIVE EXPECTANCY ({m['Expectancy R']:+.2f}R)", m
+    if m["Profit factor"] <= 1.05:
+        return False, f"WEAK PROFIT FACTOR ({m['Profit factor']:.2f})", m
+    return True, (
+        f"PASS • n={m['Trades']} • Exp {m['Expectancy R']:+.2f}R • "
+        f"PF {m['Profit factor']:.2f}"
+    ), m
+
+def option_contract_gate(sym, direction, ltp, expiry):
+    """
+    A real OPTION BUY label is allowed only when a live NFO candidate and quote
+    pass basic executable-contract checks. No fabricated IV/Greeks.
+    """
+    oc = option_contract_hint(sym, direction, ltp, expiry)
+    if not oc:
+        return False, None, None, "No matching near-ATM contract"
+    snap = option_live_snapshot(oc["tradingsymbol"])
+    if not snap:
+        return False, oc, None, "Live option quote unavailable"
+    if snap.get("ltp", 0) <= 0:
+        return False, oc, snap, "Invalid/zero option premium"
+    if snap.get("volume", 0) <= 0:
+        return False, oc, snap, "No traded volume"
+    spread_pct = snap.get("spread_pct", np.nan)
+    if not np.isfinite(spread_pct):
+        return False, oc, snap, "Bid/ask spread unavailable"
+    if spread_pct > 2.0:
+        return False, oc, snap, f"Spread too wide ({spread_pct:.2f}%)"
+    return True, oc, snap, f"PASS • premium ₹{snap['ltp']:.2f} • spread {spread_pct:.2f}%"
+
+def final_strategy_gate(row, proposed_strategy, evidence_bt, expiry):
+    """
+    End-to-end gate:
+      daily setup -> historical evidence -> 15m/event logic -> executable option contract.
+    Historical evidence applies only to the daily engine.
+    """
+    ev_ok, ev_text, evm = evidence_gate(row["Direction"], row["Score"], evidence_bt)
+    if not ev_ok:
+        return "NO TRADE", ev_text, None, None
+
+    # Intraday and option entries require current 15m confirmation.
+    if proposed_strategy in ("INTRADAY STOCK", "OPTION BUY") and not bool(row["15m Confirm"]):
+        return "NO TRADE", f"EVIDENCE PASS; LIVE 15m FAIL ({row['15m checks']})", None, evm
+
+    if row.get("Event impact") == "HIGH" and int(row["Score"]) < 80:
+        return "NO TRADE", "HIGH EVENT RISK • underlying score below 80", None, evm
+
+    if proposed_strategy == "OPTION BUY":
+        ok, oc, snap, why = option_contract_gate(
+            row["Symbol"], row["Direction"], row["Live LTP"], expiry
+        )
+        if not ok:
+            return "NO TRADE", f"EVIDENCE PASS; OPTION CONTRACT FAIL • {why}", oc, evm
+        return "OPTION BUY", f"EVIDENCE PASS; OPTION CONTRACT {why}", oc, evm
+
+    return proposed_strategy, ev_text, None, evm
+
+
 # ==================== v1.5 UI ====================
 
 tab1,tab2,tab3,tab4,tab5,tab6 = st.tabs(
@@ -731,11 +829,14 @@ with tab2:
     risk=b.number_input("Risk per trade %",.25,2.0,1.0,.25,key="v15_risk")
     minscore=st.slider("Minimum underlying setup score",55,90,70,5,key="v15_min")
 
-    if st.button("Run ALPHA v1.6.2 Strategy Scanner",use_container_width=True):
+    if st.button("Run ALPHA v1.8.2 Evidence-Gated Scanner",use_container_width=True):
         scan_time=now_ist()
         regime,bias=nifty_regime()
         event_book=nse_event_book()
         exp=expiry_context()
+        with st.spinner("Loading/rebuilding historical DAILY evidence gate..."):
+            evidence_bt = build_evidence_database(years=5, min_score=70, max_hold=20)
+        st.session_state.alpha_evidence_bt = evidence_bt
         q=kite.ltp([f"NSE:{s}" for s in SYMS])
         rows=[]
         bar=st.progress(0)
@@ -747,7 +848,7 @@ with tab2:
                     ok,msg,passed,failed=intraday_confirm(s,z["Direction"])
                     ev,impact,items=stock_event_summary(s,event_book)
                     scores=strategy_scores(z,ok,impact,regime,exp)
-                    strat=choose_strategy(scores,z["Direction"],exp)
+                    proposed=choose_strategy(scores,z["Direction"],exp)
                     bestscore=max(scores["INTRADAY"],scores["SWING"],scores["OPTIONS"])
                     z.update({
                         "15m Confirm":ok,"15m checks":f"{passed}/4",
@@ -755,8 +856,17 @@ with tab2:
                         "News / Event":ev,"Event impact":impact,
                         "IntradayScore":scores["INTRADAY"],"SwingScore":scores["SWING"],
                         "OptionsScore":scores["OPTIONS"],"LongTermTechnical":scores["LONGTERM_TECH"],
-                        "Recommended Strategy":strat,"BestScore":bestscore
+                        "Proposed Strategy":proposed,"BestScore":bestscore
                     })
+                    final_strat, gate_text, gated_option, evm = final_strategy_gate(
+                        z, proposed, evidence_bt, exp
+                    )
+                    z["Recommended Strategy"] = final_strat
+                    z["Evidence Gate"] = gate_text
+                    z["Evidence Trades"] = evm["Trades"] if evm else 0
+                    z["Evidence Expectancy R"] = round(evm["Expectancy R"],3) if evm else np.nan
+                    z["Evidence Profit Factor"] = round(evm["Profit factor"],3) if evm else np.nan
+                    z["_GatedOption"] = gated_option
                     rows.append(z)
             bar.progress((i+1)/len(SYMS))
         df=pd.DataFrame(rows)
@@ -786,10 +896,11 @@ with tab2:
             st.write(f"**T1:** ₹{r['T1']:,.2f} • **T2:** ₹{r['T2']:,.2f} • **Planned SL risk:** ~₹{r['Planned loss ₹']:,.0f}")
             st.write(f"**News / Event:** {r['News / Event']} • Risk: {r['Event impact']}")
             st.write(f"**15m:** {r['15m checks']} • Failed: {r['15m failed']}")
-            st.caption(f"Underlying evidence: {r.Why}")
+            st.caption(f"Underlying technical evidence: {r.Why}")
+            st.write(f"**Historical evidence gate:** {r['Evidence Gate']}")
 
             if r["Recommended Strategy"]=="OPTION BUY":
-                oc=option_contract_hint(r.Symbol,r.Direction,r["Live LTP"],exp)
+                oc=r.get("_GatedOption") if isinstance(r.get("_GatedOption"), dict) else option_contract_hint(r.Symbol,r.Direction,r["Live LTP"],exp)
                 if oc:
                     st.write(f"**Option candidate:** {oc['tradingsymbol']} • {oc['type']} • Strike {oc['strike']:.0f} • Expiry {oc['expiry']} • Lot {oc['lot_size']}")
                     st.warning("Contract selection is preliminary: v1.5 does not yet model IV/Greeks or option-premium stop/target, so do not treat this as a fully validated options entry.")
@@ -821,7 +932,8 @@ with tab2:
 
         with st.expander("All strategy scores"):
             cols=["Symbol","Direction","Score","IntradayScore","SwingScore","OptionsScore","LongTermTechnical",
-                  "Recommended Strategy","15m checks","News / Event","Event impact"]
+                  "Proposed Strategy","Recommended Strategy","Evidence Gate","Evidence Trades",
+                  "Evidence Expectancy R","Evidence Profit Factor","15m checks","News / Event","Event impact"]
             st.dataframe(_safe_dataframe_view(df, cols, "BestScore", ascending=False),use_container_width=True,hide_index=True)
 
         st.caption("LongTermTechnical is only a technical suitability indicator. ALPHA will not call a stock a long-term investment until a fundamentals/valuation data layer is added.")
@@ -891,6 +1003,18 @@ with tab5:
     bt_hold=c3.selectbox("Maximum holding days",[5,10,15,20,30],index=3,key="bt_hold")
     bt_syms=st.multiselect("Stocks to validate",SYMS,default=SYMS[:10],key="bt_syms")
     st.warning("This validates the DAILY technical engine, not the live 15-minute confirmation, NSE-event filter, or option-premium logic. Mixing those into this result without point-in-time historical data would create fake precision.")
+    with st.expander("Live scanner evidence database / gate", expanded=False):
+        evidence_bt = st.session_state.get("alpha_evidence_bt", pd.DataFrame())
+        if evidence_bt is None or evidence_bt.empty:
+            st.caption("Run the v1.8.2 scanner once to build the cached 5-year evidence database.")
+        else:
+            em = backtest_metrics(evidence_bt)
+            st.write(
+                f"Evidence trades: **{em['Trades']}** • Expectancy **{em['Expectancy R']:+.3f}R** • "
+                f"Profit factor **{em['Profit factor']:.2f}** • Net **{em['Net R']:+.1f}R**"
+            )
+            st.caption("This gate can reject live setups. It does not convert daily evidence into a claimed historical validation of 15m/events/options.")
+
     if st.button("Run historical validation",use_container_width=True,key="run_bt"):
         all_bt=[]; prog=st.progress(0)
         for i,sym in enumerate(bt_syms):
@@ -929,11 +1053,14 @@ with tab5:
 
 with tab6:
     st.markdown("""
-### ALPHA v1.7 rules
+### ALPHA v1.8.2 rules
 
 - The app knows the current India date, weekday and cash-market session.
 - Expiry is derived from Zerodha's current NFO instrument master instead of hard-coding a weekday.
 - Every stock gets separate **Intraday / Swing / Options** setup-quality scores.
+- The live scanner is now **historical-evidence gated**: a proposed setup is converted to **NO TRADE** when matching daily-engine evidence has insufficient sample size, non-positive expectancy, or weak profit factor.
+- **OPTION BUY** is not displayed as the final recommendation unless the live NFO contract exists and passes quote/volume/bid-ask-spread checks.
+- The evidence gate is deliberately conservative and does **not** claim that daily backtest evidence validates the live 15m, NSE-event, or option-premium layers.
 - These numbers are **NOT win probabilities**. Real win probability will only be displayed after enough completed strategy-specific trades exist.
 - Options require a substantially higher threshold than stock trades, and near-expiry conditions make the filter stricter.
 - **I ENTERED THIS TRADE** records the actual entry and changes the workflow from scanning to position management.

@@ -8,8 +8,28 @@ import sqlite3
 from kiteconnect import KiteConnect
 from pathlib import Path
 
-st.set_page_config(page_title="ALPHA Live v1.6.1", page_icon="🎯", layout="wide", initial_sidebar_state="collapsed")
-st.title("🎯 ALPHA Live v1.6.1")
+
+def _safe_dataframe_view(df, requested_cols=None, sort_col=None, ascending=False):
+    """Return a display-safe DataFrame even when schema/API columns are missing."""
+    import pandas as pd
+    if df is None:
+        return pd.DataFrame()
+    if not isinstance(df, pd.DataFrame):
+        try:
+            df = pd.DataFrame(df)
+        except Exception:
+            return pd.DataFrame()
+    out = df.copy()
+    if requested_cols:
+        existing = [c for c in requested_cols if c in out.columns]
+        out = out.loc[:, existing] if existing else out
+    if sort_col and sort_col in out.columns:
+        out = out.sort_values(sort_col, ascending=ascending, na_position="last")
+    return out
+
+
+st.set_page_config(page_title="ALPHA Live v1.6.2", page_icon="🎯", layout="wide", initial_sidebar_state="collapsed")
+st.title("🎯 ALPHA Live v1.6.2")
 st.caption("Live Zerodha decision-support • technicals + 15m confirmation + NSE corporate events • manual execution")
 
 try:
@@ -603,7 +623,7 @@ with tab2:
     risk=b.number_input("Risk per trade %",.25,2.0,1.0,.25,key="v15_risk")
     minscore=st.slider("Minimum underlying setup score",55,90,70,5,key="v15_min")
 
-    if st.button("Run ALPHA v1.5 Strategy Scanner",use_container_width=True):
+    if st.button("Run ALPHA v1.6.2 Strategy Scanner",use_container_width=True):
         scan_time=now_ist()
         regime,bias=nifty_regime()
         event_book=nse_event_book()
@@ -666,7 +686,7 @@ with tab2:
                     st.write(f"**Option candidate:** {oc['tradingsymbol']} • {oc['type']} • Strike {oc['strike']:.0f} • Expiry {oc['expiry']} • Lot {oc['lot_size']}")
                     st.warning("Contract selection is preliminary: v1.5 does not yet model IV/Greeks or option-premium stop/target, so do not treat this as a fully validated options entry.")
                 else:
-                    st.warning("No matching option contract candidate resolved; do not force an options trade.")
+                    st.warning("Underlying/options setup scored well, but no tradable option contract passed the contract filters (expiry/strike/liquidity/quote checks). Do not force an options trade.")
 
             with st.expander("I ENTERED THIS TRADE"):
                 actual=st.number_input("Actual entry price",min_value=.01,value=float(r.Entry),key=f"entry_{r.Symbol}_{idx}")
@@ -694,7 +714,7 @@ with tab2:
         with st.expander("All strategy scores"):
             cols=["Symbol","Direction","Score","IntradayScore","SwingScore","OptionsScore","LongTermTechnical",
                   "Recommended Strategy","15m checks","News / Event","Event impact"]
-            st.dataframe(df[cols].sort_values("BestScore",ascending=False),use_container_width=True,hide_index=True)
+            st.dataframe(_safe_dataframe_view(df, cols, "BestScore", ascending=False),use_container_width=True,hide_index=True)
 
         st.caption("LongTermTechnical is only a technical suitability indicator. ALPHA will not call a stock a long-term investment until a fundamentals/valuation data layer is added.")
 

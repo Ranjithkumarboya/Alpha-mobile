@@ -28,8 +28,8 @@ def _safe_dataframe_view(df, requested_cols=None, sort_col=None, ascending=False
     return out
 
 
-st.set_page_config(page_title="ALPHA Live v1.9", page_icon="🎯", layout="wide", initial_sidebar_state="collapsed")
-st.title("🎯 ALPHA Live v1.9")
+st.set_page_config(page_title="ALPHA Live v1.9.1", page_icon="🎯", layout="wide", initial_sidebar_state="collapsed")
+st.title("🎯 ALPHA Live v1.9.1")
 st.caption("Live Zerodha decision-support • technicals + 15m confirmation + NSE corporate events • manual execution")
 
 try:
@@ -307,12 +307,34 @@ def score_stock(sym, ltp, capital, risk_pct):
         "Why":" • ".join(why[:5])
     }
 
+def _is_fresh_15m_bar(ts):
+    """Reject stale intraday confirmation during market hours. Outside market hours, allow the latest completed trading bar for review only."""
+    try:
+        t = pd.Timestamp(ts)
+        if t.tzinfo is None:
+            t = t.tz_localize(IST)
+        else:
+            t = t.tz_convert(IST)
+        now = pd.Timestamp(now_ist())
+        if now.weekday() >= 5:
+            return True, "Market closed / weekend"
+        mins = now.hour * 60 + now.minute
+        if mins < 9*60+15 or mins > 15*60+30:
+            return True, "Market closed; using latest completed bar"
+        age = now - t
+        return age <= pd.Timedelta(minutes=35), f"15m bar age {int(age.total_seconds()//60)} min"
+    except Exception:
+        return False, "Could not verify 15m bar freshness"
+
 def intraday_confirm(sym, direction):
     """Four-factor 15m confirmation: EMA20, session VWAP, candle direction, relative volume."""
     try:
         d = hist(sym, "15minute", 10)
         if len(d) < 30:
             return False, "Insufficient 15m data", 0, ["Insufficient 15m history"]
+        fresh, fresh_msg = _is_fresh_15m_bar(d.index[-1])
+        if not fresh:
+            return False, "Stale 15m confirmation", 0, [fresh_msg]
 
         c = d.Close.astype(float)
         h = d.High.astype(float)
@@ -478,8 +500,11 @@ def option_contract_hint(sym, direction, ltp, expiry):
 def _db():
     # Local SQLite persistence. Survives normal reruns/restarts on a stable host,
     # but Streamlit Community Cloud can replace the filesystem on redeploy.
-    path = Path("/tmp/alpha_trades.db")
-    con = sqlite3.connect(path, check_same_thread=False)
+    path = Path(st.secrets.get("ALPHA_DB_PATH", str(Path(__file__).resolve().parent / "alpha_trades.db")))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(str(path), check_same_thread=False, timeout=10)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA busy_timeout=10000")
     con.execute("""CREATE TABLE IF NOT EXISTS trades(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         symbol TEXT, direction TEXT, strategy TEXT, entry REAL, qty INTEGER,
@@ -748,6 +773,9 @@ def final_strategy_gate(row, proposed_strategy, evidence_bt, expiry):
     """
     if evidence_bt is None or evidence_bt.empty:
         return "NO TRADE","EVIDENCE DATABASE UNAVAILABLE",None,None
+    _, _, market_session = market_clock()
+    if proposed_strategy in ("INTRADAY STOCK", "OPTION BUY") and market_session != "MARKET OPEN":
+        return "NO TRADE", f"LIVE ENTRY DISABLED • {market_session}", None, None
     ev_ok, ev_text, evm = evidence_gate(row["Direction"], row["Score"], evidence_bt)
     if not ev_ok:
         return "NO TRADE", ev_text, None, None
@@ -773,8 +801,11 @@ def final_strategy_gate(row, proposed_strategy, evidence_bt, expiry):
 def option_risk_plan(snap,capital,risk_pct,lot_size):
     if not snap or snap.get("ltp",0)<=0 or lot_size<=0:return None
     e=float(snap["ltp"]);sl=e*.75;t1=e*1.40;t2=e*1.70;ru=max(e-sl,.01)
-    lots=max(0,int((float(capital)*float(risk_pct)/100)//(ru*int(lot_size))));qty=lots*int(lot_size)
-    return {"entry":e,"sl":sl,"t1":t1,"t2":t2,"qty":qty,"risk":qty*ru}
+    risk_budget=float(capital)*float(risk_pct)/100
+    lot_risk=ru*int(lot_size)
+    lots=max(0,int(risk_budget//lot_risk));qty=lots*int(lot_size)
+    return {"entry":e,"sl":sl,"t1":t1,"t2":t2,"qty":qty,"risk":qty*ru,
+            "risk_budget":risk_budget,"lot_risk":lot_risk,"affordable":lots>=1}
 
 def init_signal_log():
     con=_db()
@@ -846,7 +877,7 @@ with tab2:
     risk=b.number_input("Risk per trade %",.25,2.0,1.0,.25,key="v15_risk")
     minscore=st.slider("Minimum underlying setup score",55,90,70,5,key="v15_min")
 
-    if st.button("Run ALPHA v1.9 Evidence + Options Scanner",use_container_width=True):
+    if st.button("Run ALPHA v1.9.1 Evidence + Options Scanner",use_container_width=True):
         scan_time=now_ist()
         regime,bias=nifty_regime()
         event_book=nse_event_book()
@@ -856,7 +887,11 @@ with tab2:
         st.session_state.alpha_evidence_bt=evidence_bt
         if evidence_bt.empty: st.error("EVIDENCE DATABASE UNAVAILABLE — live recommendations disabled.")
         else: st.success(f"Evidence database READY • {len(evidence_bt)} historical DAILY trades • {len(SYMS)-len(evidence_failures)}/{len(SYMS)} symbols processed")
-        q=kite.ltp([f"NSE:{s}" for s in SYMS])
+        try:
+            q=kite.ltp([f"NSE:{s}" for s in SYMS])
+        except Exception as e:
+            st.error(f"Live NSE quotes unavailable: {e}")
+            q={}
         rows=[]
         bar=st.progress(0)
         for i,s in enumerate(SYMS):
@@ -896,6 +931,9 @@ with tab2:
         x=st.session_state.last_v15_scan
         df=x["df"]; regime=x["regime"]; exp=x["expiry"]
         st.write(f"**Market regime:** {regime} • **Scan:** {x['time'].strftime('%d-%b-%Y %I:%M:%S %p IST')} • **Expiry:** {exp['label']}")
+        _, _, _sess = market_clock()
+        if _sess != "MARKET OPEN":
+            st.info(f"{_sess}: scanner output is for review. New intraday/options entries are fail-closed until the cash market is open.")
         actionable=df[(df.Score>=minscore)&(df["Recommended Strategy"]!="NO TRADE")].sort_values("BestScore",ascending=False).head(5)
 
         if not len(actionable):
@@ -907,10 +945,15 @@ with tab2:
                 _oc=r.get("_GatedOption") if isinstance(r.get("_GatedOption"),dict) else None
                 if _oc:
                     _snap=option_live_snapshot(_oc["tradingsymbol"]);_opt_symbol=_oc["tradingsymbol"]
-                    _opt_plan=option_risk_plan(_snap,capital,risk_pct,int(_oc.get("lot_size",1) or 1))
+                    _opt_plan=option_risk_plan(_snap,capital,risk,int(_oc.get("lot_size",1) or 1))
                     if _opt_plan:
-                        st.write(f"**OPTION PREMIUM PLAN:** Entry ₹{_opt_plan['entry']:.2f} • SL ₹{_opt_plan['sl']:.2f} • T1 ₹{_opt_plan['t1']:.2f} • T2 ₹{_opt_plan['t2']:.2f} • Qty {_opt_plan['qty']} • Risk ₹{_opt_plan['risk']:.0f}")
-            if r["Recommended Strategy"]!="NO TRADE":log_signal_once(r,_opt_symbol,_opt_plan)
+                        if not _opt_plan.get("affordable", False):
+                            st.error(f"OPTION TRADE BLOCKED — one lot risks ~₹{_opt_plan['lot_risk']:.0f}, above your ₹{_opt_plan['risk_budget']:.0f} risk budget.")
+                            _opt_plan=None
+                        else:
+                            st.write(f"**OPTION PREMIUM PLAN:** Entry ₹{_opt_plan['entry']:.2f} • SL ₹{_opt_plan['sl']:.2f} • T1 ₹{_opt_plan['t1']:.2f} • T2 ₹{_opt_plan['t2']:.2f} • Qty {_opt_plan['qty']} • Risk ₹{_opt_plan['risk']:.0f}")
+            if r["Recommended Strategy"]!="NO TRADE" and (r["Recommended Strategy"]!="OPTION BUY" or _opt_plan):
+                log_signal_once(r,_opt_symbol,_opt_plan)
             st.write(
                 f"**Setup confidence (not historical win probability):** "
                 f"Intraday {confidence_label(r.IntradayScore)} {int(r.IntradayScore)}/100 • "
@@ -1088,7 +1131,7 @@ with tab6:
 
 with tab7:
     st.markdown("""
-### ALPHA v1.9 rules
+### ALPHA v1.9.1 rules
 
 - The app knows the current India date, weekday and cash-market session.
 - Expiry is derived from Zerodha's current NFO instrument master instead of hard-coding a weekday.
@@ -1102,6 +1145,8 @@ with tab7:
 - Tracked trades use strategy-specific HOLD / PROTECT PROFIT / PARTIAL EXIT / EXIT logic on refresh.
 - Long-term investing is not recommended from technicals alone. Fundamentals and valuation are still missing.
 - News/events remain an official-NSE event-risk layer; “None detected” is not proof that no relevant public news exists.
+- Intraday and option-buy recommendations are fail-closed outside cash-market hours and when the latest 15m bar is stale.
+- Option sizing must fit at least one full lot inside the selected risk budget; otherwise the trade is blocked.
 - No automatic order placement.
 - The Backtest Lab validates the daily technical engine with next-session execution and conservative same-bar stop/target handling; it does not pretend to validate historical 15m/event/options layers without point-in-time data.
 

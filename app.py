@@ -777,20 +777,39 @@ def option_risk_plan(snap,capital,risk_pct,lot_size):
     return {"entry":e,"sl":sl,"t1":t1,"t2":t2,"qty":qty,"risk":qty*ru}
 
 def init_signal_log():
-    con=sqlite3.connect(DB_PATH);con.execute("""CREATE TABLE IF NOT EXISTS alpha_signals(
+    con=_db()
+    con.execute("""CREATE TABLE IF NOT EXISTS alpha_signals(
     id INTEGER PRIMARY KEY AUTOINCREMENT,created_at TEXT,symbol TEXT,direction TEXT,strategy TEXT,
-    score REAL,evidence TEXT,option_symbol TEXT,entry REAL,sl REAL,t1 REAL,t2 REAL,qty INTEGER,status TEXT)""");con.commit();con.close()
+    score REAL,evidence TEXT,option_symbol TEXT,entry REAL,sl REAL,t1 REAL,t2 REAL,qty INTEGER,status TEXT)""")
+    con.commit()
+    con.close()
 
 def log_signal_once(r,opt="",plan=None):
-    init_signal_log();con=sqlite3.connect(DB_PATH);day=datetime.now(IST).strftime("%Y-%m-%d")
-    hit=con.execute("SELECT id FROM alpha_signals WHERE substr(created_at,1,10)=? AND symbol=? AND strategy=?",(day,r["Symbol"],r["Recommended Strategy"])).fetchone()
+    init_signal_log()
+    con=_db()
+    day=datetime.now(IST).strftime("%Y-%m-%d")
+    hit=con.execute(
+        "SELECT id FROM alpha_signals WHERE substr(created_at,1,10)=? AND symbol=? AND strategy=?",
+        (day,r["Symbol"],r["Recommended Strategy"])
+    ).fetchone()
     if not hit:
-        p=plan or {};con.execute("INSERT INTO alpha_signals(created_at,symbol,direction,strategy,score,evidence,option_symbol,entry,sl,t1,t2,qty,status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),r["Symbol"],r["Direction"],r["Recommended Strategy"],float(r["Score"]),r.get("Evidence Gate",""),opt,float(p.get("entry",0)),float(p.get("sl",0)),float(p.get("t1",0)),float(p.get("t2",0)),int(p.get("qty",0)),"OPEN"));con.commit()
+        p=plan or {}
+        con.execute(
+            "INSERT INTO alpha_signals(created_at,symbol,direction,strategy,score,evidence,option_symbol,entry,sl,t1,t2,qty,status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),r["Symbol"],r["Direction"],
+             r["Recommended Strategy"],float(r["Score"]),r.get("Evidence Gate",""),opt,
+             float(p.get("entry",0)),float(p.get("sl",0)),float(p.get("t1",0)),
+             float(p.get("t2",0)),int(p.get("qty",0)),"OPEN")
+        )
+        con.commit()
     con.close()
 
 def load_signal_log():
-    init_signal_log();con=sqlite3.connect(DB_PATH);d=pd.read_sql_query("SELECT * FROM alpha_signals ORDER BY id DESC",con);con.close();return d
+    init_signal_log()
+    con=_db()
+    d=pd.read_sql_query("SELECT * FROM alpha_signals ORDER BY id DESC",con)
+    con.close()
+    return d
 
 
 # ==================== v1.5 UI ====================
